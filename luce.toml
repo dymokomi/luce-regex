@@ -1,0 +1,6 @@
+[package]
+name = "luce_regex"
+source = "src"
+
+[exports]
+regex = "luce_regex.regex"
