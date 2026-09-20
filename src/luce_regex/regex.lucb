@@ -1,0 +1,1519 @@
+#==============================================================================================
+#
+#   regex - a small, fast regular-expression engine
+#
+#   DESCRIPTION:
+#       A from-scratch matcher covering the Oniguruma subset that TextMate grammars use, so
+#       highlighting needs no external regex. A pattern is parsed to an AST (a pool of index-linked
+#       nodes), compiled once to a flat array of instructions, and matched by an ITERATIVE
+#       backtracking VM (Cox / RE2 / Go design) over a subject of Unicode codepoints (u32).
+#       Positions are codepoint indices, exactly how the editor counts offsets. A step budget
+#       bounds pathological patterns rather than letting them hang. The hot loop is integer
+#       comparisons and touches no allocation per step.
+#
+#       Supported: literals, `.`, classes ([...], ranges, negation, \d \w \s \h and negated forms,
+#       a POSIX/\p subset), anchors (^ $ \b \B \A \G \z \Z), groups (capturing, (?:), named),
+#       alternation `|`, quantifiers (* + ? {n} {n,} {n,m}, greedy and lazy), backreferences
+#       (numeric and named), lookahead and lookbehind, case-insensitive matching, and the inline
+#       flags (?i) (?x) (?s) (?m).
+#
+#==============================================================================================
+
+import memory
+import utf8
+import interop
+
+## A pattern the engine could not parse.
+pub let syntax_error: ErrorCode = ErrorCode.package(330)
+
+# mark: Constants =============================================================================
+
+# AST node kinds.
+let K_EMPTY: u8 = 0
+let K_CHAR: u8 = 1
+let K_ANY: u8 = 2
+let K_CLASS: u8 = 3
+let K_ANCHOR: u8 = 4
+let K_CONCAT: u8 = 5
+let K_ALT: u8 = 6
+let K_REPEAT: u8 = 7
+let K_GROUP: u8 = 8
+let K_BACKREF: u8 = 9
+let K_LOOK: u8 = 10
+
+# Anchor kinds.
+let AN_BOL: u8 = 0
+let AN_EOL: u8 = 1
+let AN_WORDB: u8 = 2
+let AN_NWORDB: u8 = 3
+let AN_BUFS: u8 = 4
+let AN_G: u8 = 5
+let AN_BUFE: u8 = 6
+
+# Opcodes.
+let OP_CHAR: u8 = 0      # ch
+let OP_ANY: u8 = 1
+let OP_CLASS: u8 = 2     # x = class index
+let OP_MATCH: u8 = 3
+let OP_JMP: u8 = 4       # x = target
+let OP_SPLIT: u8 = 5     # x = preferred target, y = alternative
+let OP_SAVE: u8 = 6      # x = capture slot
+let OP_ASSERT: u8 = 7    # x = anchor kind
+let OP_BACKREF: u8 = 8   # x = group index
+let OP_LOOK: u8 = 9      # x = subprogram index; ahead, negate
+let OP_MARK: u8 = 10     # x = mark slot (record position)
+let OP_PROGRESS: u8 = 11 # x = mark slot: fail if the position has not advanced (empty-loop guard)
+
+# Builtin character-class bits.
+let B_d: u32 = 1
+let B_D: u32 = 2
+let B_w: u32 = 4
+let B_W: u32 = 8
+let B_s: u32 = 16
+let B_S: u32 = 32
+let B_h: u32 = 64
+let B_H: u32 = 128
+
+# mark: A growable vector =====================================================================
+
+## A minimal growable array. Backtrack and save-log stacks are reused across match attempts,
+## so matching allocates nothing per step once they are warm.
+struct Vec[T]:
+    var data: T[]
+    var used: usize = 0
+
+    mutating func ensure(count: usize) -> !:
+        if count <= self.data.length:
+            return
+        var capacity: usize = 8 if self.data.length == 0 else self.data.length * 2
+        while capacity < count:
+            capacity = capacity * 2
+        let grown = try alloc T[capacity] in memory.heap
+        var i: usize = 0
+        while i < self.used:
+            grown[i] = self.data[i]
+            i += 1
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        self.data = grown
+
+    mutating func push(value: T) -> usize!:
+        try self.ensure(self.used + 1)
+        self.data[self.used] = value
+        self.used += 1
+        return self.used - 1
+
+    ## Set index `i`, growing by one when `i` is at the end. Infallible: an allocation
+    ## failure here (only under memory exhaustion) traps rather than unwinding the VM loop.
+    mutating func put(i: usize, value: T):
+        if i < self.used:
+            self.data[i] = value
+        else:
+            discard(self.push(value) catch failure: trap("out of memory in regex vm"))
+
+    mutating func free_all():
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        var empty: T[]
+        self.data = empty
+        self.used = 0
+
+# mark: Structures ============================================================================
+
+## One compiled instruction. Fields are reused across opcodes.
+struct Inst:
+    var op: u8 = 0
+    var x: i32 = 0
+    var y: i32 = 0
+    var ch: u32 = 0
+    var ahead: bool = true
+    var negate: bool = false
+
+## One AST node. `a` holds a group index, anchor kind, backref index, repeat minimum, or a class
+## index; `b` a repeat maximum (-1 = unbounded). Children are an index-linked list.
+struct Node:
+    var kind: u8 = 0
+    var ch: u32 = 0
+    var a: i32 = 0
+    var b: i32 = 0
+    var greedy: bool = true
+    var ahead: bool = true
+    var negate: bool = false
+    var first_child: i32 = -1
+    var next_sibling: i32 = -1
+
+## A compiled character class: builtin bits plus a run of (lo, hi) codepoint ranges in the pool.
+struct CharClass:
+    var negate: bool = false
+    var builtins: u32 = 0
+    var range_start: usize = 0
+    var range_count: usize = 0
+
+## A lookaround subprogram: its own flat instruction array ending in MATCH.
+struct Program:
+    var code: Inst[]
+    var length: usize = 0
+
+## A named capturing group.
+struct NameEntry:
+    var start: i32 = 0
+    var len: i32 = 0
+    var group: i32 = 0
+
+## A slice into the codepoint name pool.
+struct Span:
+    var start: i32 = 0
+    var len: i32 = 0
+
+# mark: The engine ============================================================================
+
+## A compiled pattern with its last-match state. Compile once, then call `search`/`match_at`
+## (native, over a codepoint subject) or `find` (over a `str`); read the result with the
+## accessors. Distinct patterns use distinct `Regex` values, so their last-match state is
+## independent.
+pub struct Regex:
+    # Parse/compile scratch (freed after `build`).
+    var pat: Vec[u32]
+    var pp: usize = 0
+    var nodes: Vec[Node]
+    # Flags.
+    var ic: bool = false
+    var ext: bool = false
+    var dotall: bool = false
+    var multi: bool = false
+    # Groups and names.
+    var ngroups: i32 = 0
+    var name_cps: Vec[u32]
+    var names: Vec[NameEntry]
+    # Classes.
+    var classes: Vec[CharClass]
+    var ranges: Vec[u32]
+    # Compiled program.
+    var code: Vec[Inst]
+    var subprogs: Vec[Program]
+    var mark_count: i32 = 0
+    var marks: i32[]
+    var caps: i32[]
+    var has_g: bool = false
+    # First-character filter.
+    var first_any: bool = false
+    var first_chars: Vec[u32]
+    var first_classes: Vec[i32]
+    # Match state.
+    var subj: const u32[]
+    var len: i32 = 0
+    var anchor: i32 = 0
+    var steps: i32 = 0
+    var budget: i32 = 200000
+    # Reusable stacks for the main run (a lookaround uses fresh local stacks).
+    var bt_pc: Vec[i32]
+    var bt_sp: Vec[i32]
+    var bt_log: Vec[i32]
+    var log_slot: Vec[i32]
+    var log_val: Vec[i32]
+    # Buffer for the `str` convenience path.
+    var text_subj: Vec[u32]
+
+    ## Compile `pattern`. `ignore_case` starts the whole pattern case-insensitive; an inline
+    ## `(?i)` has the same effect. A malformed pattern fails with `syntax_error`.
+    pub func init(pattern: str, ignore_case: bool = false) -> !:
+        self.pp = 0
+        self.ic = false
+        self.ext = false
+        self.dotall = false
+        self.multi = false
+        self.ngroups = 0
+        self.mark_count = 0
+        self.has_g = false
+        self.first_any = false
+        self.len = 0
+        self.anchor = 0
+        self.steps = 0
+        self.budget = 200000
+        self.pat = Vec[u32]()
+        self.nodes = Vec[Node]()
+        self.name_cps = Vec[u32]()
+        self.names = Vec[NameEntry]()
+        self.classes = Vec[CharClass]()
+        self.ranges = Vec[u32]()
+        self.code = Vec[Inst]()
+        self.subprogs = Vec[Program]()
+        self.first_chars = Vec[u32]()
+        self.first_classes = Vec[i32]()
+        self.bt_pc = Vec[i32]()
+        self.bt_sp = Vec[i32]()
+        self.bt_log = Vec[i32]()
+        self.log_slot = Vec[i32]()
+        self.log_val = Vec[i32]()
+        self.text_subj = Vec[u32]()
+        var empty: i32[]
+        self.marks = empty
+        self.caps = empty
+        var empty_subj: u32[]
+        self.subj = empty_subj
+        self.build(pattern, ignore_case) catch failure:
+            self.dispose()
+            error(failure.code, failure.message)
+
+    mutating func build(pattern: str, ignore_case: bool) -> !:
+        self.ic = ignore_case
+        self.budget = 200000
+        try decode_subj(pattern, &self.pat)
+        let root = try self.parse_alt()
+        if self.pp < self.pat.used:
+            error(syntax_error, "trailing characters in pattern")
+        let ncap = (usize)(2 * (self.ngroups + 1))
+        self.caps = try alloc i32[ncap] in memory.heap
+        var i: usize = 0
+        while i < ncap:
+            self.caps[i] = -1
+            i += 1
+        try self.compile_node(root, &self.code)
+        discard(try self.code.push(Inst(op = OP_MATCH)))
+        if self.mark_count > 0:
+            self.marks = try alloc i32[(usize)self.mark_count] in memory.heap
+            var m: usize = 0
+            while m < (usize)self.mark_count:
+                self.marks[m] = 0
+                m += 1
+        try self.compute_first()
+        self.pat.free_all()
+        self.nodes.free_all()
+
+    # -- parser --------------------------------------------------------------------------------
+
+    func cur_cp() -> u32:
+        return self.pat.data[self.pp] if self.pp < self.pat.used else 0
+
+    mutating func new_node(kind: u8) -> i32!:
+        var node = Node()
+        node.kind = kind
+        let index = try self.nodes.push(node)
+        return (i32)index
+
+    mutating func mk_char(cp: u32) -> i32!:
+        let n = try self.new_node(K_CHAR)
+        self.nodes.data[(usize)n].ch = cp
+        return n
+
+    mutating func mk_anchor(kind: u8) -> i32!:
+        let n = try self.new_node(K_ANCHOR)
+        self.nodes.data[(usize)n].a = (i32)kind
+        return n
+
+    mutating func parse_alt() -> i32!:
+        let first = try self.parse_concat()
+        var tail = first
+        var count: i32 = 1
+        while self.pp < self.pat.used and self.pat.data[self.pp] == (u32)'|':
+            self.pp += 1
+            let branch = try self.parse_concat()
+            self.nodes.data[(usize)tail].next_sibling = branch
+            tail = branch
+            count += 1
+        if count == 1:
+            return first
+        let node = try self.new_node(K_ALT)
+        self.nodes.data[(usize)node].first_child = first
+        return node
+
+    mutating func parse_concat() -> i32!:
+        var head: i32 = -1
+        var tail: i32 = -1
+        var count: i32 = 0
+        while true:
+            if self.ext:
+                self.skip_ws()
+            if self.pp >= self.pat.used:
+                break
+            let ch = self.pat.data[self.pp]
+            if ch == (u32)'|' or ch == (u32)')':
+                break
+            let part = try self.parse_repeat()
+            if head == -1:
+                head = part
+                tail = part
+            else:
+                self.nodes.data[(usize)tail].next_sibling = part
+                tail = part
+            count += 1
+        if count == 0:
+            return try self.new_node(K_EMPTY)
+        if count == 1:
+            return head
+        let node = try self.new_node(K_CONCAT)
+        self.nodes.data[(usize)node].first_child = head
+        return node
+
+    mutating func parse_repeat() -> i32!:
+        let atom = try self.parse_atom()
+        if self.ext:
+            self.skip_ws()
+        if self.pp >= self.pat.used:
+            return atom
+        let ch = self.pat.data[self.pp]
+        var lo: i32 = 0
+        var hi: i32 = 0
+        var has = false
+        if ch == (u32)'*':
+            lo = 0
+            hi = -1
+            has = true
+            self.pp += 1
+        elif ch == (u32)'+':
+            lo = 1
+            hi = -1
+            has = true
+            self.pp += 1
+        elif ch == (u32)'?':
+            lo = 0
+            hi = 1
+            has = true
+            self.pp += 1
+        elif ch == (u32)'{':
+            let saved = self.pp
+            self.pp += 1
+            var mins: i32 = 0
+            var has_min = false
+            while self.pp < self.pat.used and is_digit(self.pat.data[self.pp]):
+                mins = mins * 10 + (i32)(self.pat.data[self.pp] - (u32)'0')
+                has_min = true
+                self.pp += 1
+            if not has_min:
+                self.pp = saved
+                return atom
+            var maxv: i32 = mins
+            var comma = false
+            if self.pp < self.pat.used and self.pat.data[self.pp] == (u32)',':
+                comma = true
+                self.pp += 1
+                var has_max = false
+                maxv = 0
+                while self.pp < self.pat.used and is_digit(self.pat.data[self.pp]):
+                    maxv = maxv * 10 + (i32)(self.pat.data[self.pp] - (u32)'0')
+                    has_max = true
+                    self.pp += 1
+                if not has_max:
+                    maxv = -1
+            if self.pp < self.pat.used and self.pat.data[self.pp] == (u32)'}':
+                self.pp += 1
+                lo = mins
+                hi = maxv if comma else mins
+                has = true
+            else:
+                self.pp = saved
+                return atom
+        if not has:
+            return atom
+        var greedy = true
+        if self.pp < self.pat.used and self.pat.data[self.pp] == (u32)'?':
+            greedy = false
+            self.pp += 1
+        elif self.pp < self.pat.used and self.pat.data[self.pp] == (u32)'+':
+            self.pp += 1
+        let node = try self.new_node(K_REPEAT)
+        self.nodes.data[(usize)node].a = lo
+        self.nodes.data[(usize)node].b = hi
+        self.nodes.data[(usize)node].greedy = greedy
+        self.nodes.data[(usize)node].first_child = atom
+        return node
+
+    mutating func parse_atom() -> i32!:
+        if self.ext:
+            self.skip_ws()
+        if self.pp >= self.pat.used:
+            return try self.new_node(K_EMPTY)
+        let ch = self.pat.data[self.pp]
+        if ch == (u32)'(':
+            return try self.parse_group()
+        if ch == (u32)'[':
+            return try self.parse_class()
+        if ch == (u32)'.':
+            self.pp += 1
+            return try self.new_node(K_ANY)
+        if ch == (u32)'^':
+            self.pp += 1
+            return try self.mk_anchor(AN_BOL)
+        if ch == (u32)'$':
+            self.pp += 1
+            return try self.mk_anchor(AN_EOL)
+        if ch == (u32)'\\':
+            return try self.parse_escape()
+        self.pp += 1
+        return try self.mk_char(ch)
+
+    mutating func parse_group() -> i32!:
+        self.pp += 1
+        if self.pp < self.pat.used and self.pat.data[self.pp] == (u32)'?':
+            self.pp += 1
+            let c = self.cur_cp()
+            if c == (u32)':':
+                self.pp += 1
+                return try self.grouped(0)
+            if c == (u32)'=':
+                self.pp += 1
+                return try self.parse_look(true, false)
+            if c == (u32)'!':
+                self.pp += 1
+                return try self.parse_look(true, true)
+            if c == (u32)'>':
+                self.pp += 1
+                return try self.grouped(0)
+            if c == (u32)'<':
+                self.pp += 1
+                let d = self.cur_cp()
+                if d == (u32)'=':
+                    self.pp += 1
+                    return try self.parse_look(false, false)
+                if d == (u32)'!':
+                    self.pp += 1
+                    return try self.parse_look(false, true)
+                let span = try self.read_name((u32)'>')
+                return try self.parse_named(span)
+            if c == (u32)'\'':
+                self.pp += 1
+                let span = try self.read_name((u32)'\'')
+                return try self.parse_named(span)
+            return try self.parse_flags()
+        self.ngroups += 1
+        let index = self.ngroups
+        return try self.grouped(index)
+
+    mutating func grouped(index: i32) -> i32!:
+        let inner = try self.parse_alt()
+        try self.expect((u32)')')
+        let node = try self.new_node(K_GROUP)
+        self.nodes.data[(usize)node].a = index
+        self.nodes.data[(usize)node].first_child = inner
+        return node
+
+    mutating func parse_named(name: Span) -> i32!:
+        self.ngroups += 1
+        let index = self.ngroups
+        discard(try self.names.push(NameEntry(start = name.start, len = name.len, group = index)))
+        return try self.grouped(index)
+
+    mutating func parse_look(ahead: bool, negate: bool) -> i32!:
+        let inner = try self.parse_alt()
+        try self.expect((u32)')')
+        let node = try self.new_node(K_LOOK)
+        self.nodes.data[(usize)node].ahead = ahead
+        self.nodes.data[(usize)node].negate = negate
+        self.nodes.data[(usize)node].first_child = inner
+        return node
+
+    mutating func parse_flags() -> i32!:
+        var on = true
+        while self.pp < self.pat.used:
+            let c = self.pat.data[self.pp]
+            if c == (u32)':' or c == (u32)')':
+                break
+            if c == (u32)'-':
+                on = false
+            elif c == (u32)'i':
+                if on:
+                    self.ic = true
+            elif c == (u32)'s':
+                if on:
+                    self.dotall = true
+            elif c == (u32)'m':
+                if on:
+                    self.multi = true
+            elif c == (u32)'x':
+                self.ext = on
+            self.pp += 1
+        if self.pp < self.pat.used and self.pat.data[self.pp] == (u32)':':
+            self.pp += 1
+            return try self.grouped(0)
+        try self.expect((u32)')')
+        return try self.new_node(K_EMPTY)
+
+    mutating func parse_escape() -> i32!:
+        self.pp += 1
+        if self.pp >= self.pat.used:
+            return try self.mk_char((u32)'\\')
+        let c = self.pat.data[self.pp]
+        self.pp += 1
+        if is_builtin(c):
+            let ci = try self.new_class(false, builtin_bit(c))
+            return try self.class_node(ci)
+        if c == (u32)'b':
+            return try self.mk_anchor(AN_WORDB)
+        if c == (u32)'B':
+            return try self.mk_anchor(AN_NWORDB)
+        if c == (u32)'A':
+            return try self.mk_anchor(AN_BUFS)
+        if c == (u32)'G':
+            self.has_g = true
+            return try self.mk_anchor(AN_G)
+        if c == (u32)'z' or c == (u32)'Z':
+            return try self.mk_anchor(AN_BUFE)
+        if is_digit(c) and c != (u32)'0':
+            var ds: i32 = (i32)(c - (u32)'0')
+            while self.pp < self.pat.used and is_digit(self.pat.data[self.pp]):
+                ds = ds * 10 + (i32)(self.pat.data[self.pp] - (u32)'0')
+                self.pp += 1
+            let n = try self.new_node(K_BACKREF)
+            self.nodes.data[(usize)n].a = ds
+            return n
+        if c == (u32)'k' and self.pp < self.pat.used and (self.pat.data[self.pp] == (u32)'<' or self.pat.data[self.pp] == (u32)'\''):
+            let term = (u32)'>' if self.pat.data[self.pp] == (u32)'<' else (u32)'\''
+            self.pp += 1
+            let span = try self.read_name(term)
+            let n = try self.new_node(K_BACKREF)
+            self.nodes.data[(usize)n].a = self.find_name(span)
+            return n
+        if c == (u32)'p' or c == (u32)'P':
+            let ci = try self.new_class(c == (u32)'P', 0)
+            let span = try self.read_property()
+            try self.add_property(ci, span)
+            return try self.class_node(ci)
+        let n = try self.new_node(K_CHAR)
+        self.nodes.data[(usize)n].ch = self.decode_escape(c)
+        return n
+
+    mutating func parse_class() -> i32!:
+        self.pp += 1
+        var negate = false
+        if self.pp < self.pat.used and self.pat.data[self.pp] == (u32)'^':
+            negate = true
+            self.pp += 1
+        let ci = try self.new_class(negate, 0)
+        var first = true
+        while self.pp < self.pat.used:
+            let ch = self.pat.data[self.pp]
+            if ch == (u32)']' and not first:
+                break
+            first = false
+            if ch == (u32)'[' and self.pp + 1 < self.pat.used and self.pat.data[self.pp + 1] == (u32)':':
+                try self.parse_posix(ci)
+                continue
+            if ch == (u32)'\\':
+                let lit = try self.class_escape(ci)
+                if lit >= 0:
+                    try self.maybe_range(ci, (u32)lit)
+                continue
+            self.pp += 1
+            try self.maybe_range(ci, ch)
+        try self.expect((u32)']')
+        return try self.class_node(ci)
+
+    mutating func maybe_range(ci: i32, lo: u32) -> !:
+        if self.pp < self.pat.used and self.pat.data[self.pp] == (u32)'-' and self.pp + 1 < self.pat.used and self.pat.data[self.pp + 1] != (u32)']':
+            self.pp += 1
+            var hi: u32 = 0
+            if self.pat.data[self.pp] == (u32)'\\':
+                hi = try self.class_escape_char()
+            else:
+                hi = self.pat.data[self.pp]
+                self.pp += 1
+            try self.add_range(ci, lo, hi)
+        else:
+            try self.add_range(ci, lo, lo)
+
+    mutating func class_escape(ci: i32) -> i32!:
+        self.pp += 1
+        if self.pp >= self.pat.used:
+            return (i32)(u32)'\\'
+        let c = self.pat.data[self.pp]
+        self.pp += 1
+        if is_builtin(c):
+            self.add_builtin(ci, builtin_bit(c))
+            return -1
+        if c == (u32)'p' or c == (u32)'P':
+            let span = try self.read_property()
+            try self.add_property(ci, span)
+            return -1
+        return (i32)self.decode_escape(c)
+
+    mutating func class_escape_char() -> u32!:
+        self.pp += 1
+        if self.pp >= self.pat.used:
+            return (u32)'\\'
+        let c = self.pat.data[self.pp]
+        self.pp += 1
+        return self.decode_escape(c)
+
+    ## The literal codepoint a simple escape denotes.
+    mutating func decode_escape(c: u32) -> u32:
+        if c == (u32)'n':
+            return 10
+        if c == (u32)'t':
+            return 9
+        if c == (u32)'r':
+            return 13
+        if c == (u32)'f':
+            return 12
+        if c == (u32)'v':
+            return 11
+        if c == (u32)'0':
+            return 0
+        if c == (u32)'a':
+            return 7
+        if c == (u32)'e':
+            return 27
+        if c == (u32)'b':
+            return 8
+        if c == (u32)'x':
+            return self.read_hex(2)
+        if c == (u32)'u':
+            return self.read_hex(4)
+        return c
+
+    mutating func read_hex(fixed: i32) -> u32:
+        var value: u32 = 0
+        if self.pp < self.pat.used and self.pat.data[self.pp] == (u32)'{':
+            self.pp += 1
+            while self.pp < self.pat.used and self.pat.data[self.pp] != (u32)'}':
+                value = value * 16 + (u32)hex_digit(self.pat.data[self.pp])
+                self.pp += 1
+            if self.pp < self.pat.used:
+                self.pp += 1
+        else:
+            var n: i32 = 0
+            while n < fixed and self.pp < self.pat.used and is_hex(self.pat.data[self.pp]):
+                value = value * 16 + (u32)hex_digit(self.pat.data[self.pp])
+                self.pp += 1
+                n += 1
+        return value
+
+    mutating func parse_posix(ci: i32) -> !:
+        self.pp += 2
+        let start = (i32)self.name_cps.used
+        var len: i32 = 0
+        while self.pp < self.pat.used and self.pat.data[self.pp] != (u32)':':
+            discard(try self.name_cps.push(self.pat.data[self.pp]))
+            len += 1
+            self.pp += 1
+        if self.pp < self.pat.used:
+            self.pp += 1
+        if self.pp < self.pat.used:
+            self.pp += 1
+        try self.add_property(ci, Span(start = start, len = len))
+
+    mutating func read_property() -> Span!:
+        let start = (i32)self.name_cps.used
+        var len: i32 = 0
+        if self.pp < self.pat.used and self.pat.data[self.pp] == (u32)'{':
+            self.pp += 1
+            while self.pp < self.pat.used and self.pat.data[self.pp] != (u32)'}':
+                discard(try self.name_cps.push(self.pat.data[self.pp]))
+                len += 1
+                self.pp += 1
+            if self.pp < self.pat.used:
+                self.pp += 1
+        elif self.pp < self.pat.used:
+            discard(try self.name_cps.push(self.pat.data[self.pp]))
+            len += 1
+            self.pp += 1
+        return Span(start = start, len = len)
+
+    ## Map a POSIX or Unicode property name to an ASCII approximation. Never fails: an unknown
+    ## name falls back to the word set, so an exotic grammar still loads.
+    mutating func add_property(ci: i32, name: Span) -> !:
+        if self.name_is(name, "digit") or self.name_is(name, "Digit") or self.name_is(name, "Nd") or self.name_is(name, "Number"):
+            self.add_builtin(ci, B_d)
+        elif self.name_is(name, "space") or self.name_is(name, "Space") or self.name_is(name, "White_Space"):
+            self.add_builtin(ci, B_s)
+        elif self.name_is(name, "xdigit") or self.name_is(name, "XDigit"):
+            self.add_builtin(ci, B_h)
+        elif self.name_is(name, "upper") or self.name_is(name, "Upper") or self.name_is(name, "Lu"):
+            try self.add_range(ci, (u32)'A', (u32)'Z')
+        elif self.name_is(name, "lower") or self.name_is(name, "Lower") or self.name_is(name, "Ll"):
+            try self.add_range(ci, (u32)'a', (u32)'z')
+        elif self.name_is(name, "alpha") or self.name_is(name, "Alpha") or self.name_is(name, "Alphabetic") or self.name_is(name, "L") or self.name_is(name, "Letter"):
+            try self.add_range(ci, (u32)'A', (u32)'Z')
+            try self.add_range(ci, (u32)'a', (u32)'z')
+        elif self.name_is(name, "alnum") or self.name_is(name, "Alnum"):
+            self.add_builtin(ci, B_d)
+            try self.add_range(ci, (u32)'A', (u32)'Z')
+            try self.add_range(ci, (u32)'a', (u32)'z')
+        elif self.name_is(name, "punct") or self.name_is(name, "Punct"):
+            try self.add_range(ci, (u32)'!', (u32)'/')
+            try self.add_range(ci, (u32)':', (u32)'@')
+            try self.add_range(ci, (u32)'[', (u32)'`')
+            try self.add_range(ci, (u32)'{', (u32)'~')
+        else:
+            self.add_builtin(ci, B_w)
+
+    mutating func new_class(negate: bool, builtins: u32) -> i32!:
+        var cc = CharClass()
+        cc.negate = negate
+        cc.builtins = builtins
+        cc.range_start = self.ranges.used
+        cc.range_count = 0
+        let index = try self.classes.push(cc)
+        return (i32)index
+
+    mutating func add_builtin(ci: i32, bit: u32):
+        self.classes.data[(usize)ci].builtins = self.classes.data[(usize)ci].builtins | bit
+
+    mutating func add_range(ci: i32, lo: u32, hi: u32) -> !:
+        discard(try self.ranges.push(lo))
+        discard(try self.ranges.push(hi))
+        self.classes.data[(usize)ci].range_count += 1
+
+    mutating func class_node(ci: i32) -> i32!:
+        let n = try self.new_node(K_CLASS)
+        self.nodes.data[(usize)n].a = ci
+        return n
+
+    mutating func read_name(term: u32) -> Span!:
+        let start = (i32)self.name_cps.used
+        var len: i32 = 0
+        while self.pp < self.pat.used and self.pat.data[self.pp] != term:
+            discard(try self.name_cps.push(self.pat.data[self.pp]))
+            len += 1
+            self.pp += 1
+        try self.expect(term)
+        return Span(start = start, len = len)
+
+    func find_name(span: Span) -> i32:
+        var i: usize = 0
+        while i < self.names.used:
+            let entry = self.names.data[i]
+            if entry.len == span.len and self.span_eq(entry.start, span):
+                return entry.group
+            i += 1
+        return 0
+
+    func span_eq(a_start: i32, b: Span) -> bool:
+        var i: i32 = 0
+        while i < b.len:
+            if self.name_cps.data[(usize)(a_start + i)] != self.name_cps.data[(usize)(b.start + i)]:
+                return false
+            i += 1
+        return true
+
+    func name_is(span: Span, lit: str) -> bool:
+        let bytes = lit.bytes
+        if (usize)span.len != bytes.length:
+            return false
+        var i: usize = 0
+        while i < (usize)span.len:
+            if self.name_cps.data[(usize)span.start + i] != (u32)bytes[i]:
+                return false
+            i += 1
+        return true
+
+    mutating func expect(cp: u32) -> !:
+        if self.pp < self.pat.used and self.pat.data[self.pp] == cp:
+            self.pp += 1
+            return
+        error(syntax_error, "missing a delimiter in pattern")
+
+    mutating func skip_ws():
+        while self.pp < self.pat.used:
+            let c = self.pat.data[self.pp]
+            if c == (u32)' ' or c == (u32)'\t' or c == (u32)'\n' or c == (u32)'\r':
+                self.pp += 1
+            elif c == (u32)'#':
+                while self.pp < self.pat.used and self.pat.data[self.pp] != (u32)'\n':
+                    self.pp += 1
+            else:
+                break
+
+    # -- compiler ------------------------------------------------------------------------------
+
+    mutating func compile_node(ni: i32, out: Vec[Inst]*) -> !:
+        let node = self.nodes.data[(usize)ni]
+        let kind = node.kind
+        if kind == K_CHAR:
+            var inst = Inst(op = OP_CHAR)
+            inst.ch = node.ch
+            discard(try out.push(inst))
+        elif kind == K_ANY:
+            discard(try out.push(Inst(op = OP_ANY)))
+        elif kind == K_CLASS:
+            var inst = Inst(op = OP_CLASS)
+            inst.x = node.a
+            discard(try out.push(inst))
+        elif kind == K_ANCHOR:
+            var inst = Inst(op = OP_ASSERT)
+            inst.x = node.a
+            discard(try out.push(inst))
+        elif kind == K_CONCAT:
+            var child = node.first_child
+            while child != -1:
+                try self.compile_node(child, out)
+                child = self.nodes.data[(usize)child].next_sibling
+        elif kind == K_ALT:
+            try self.compile_alt(ni, out)
+        elif kind == K_GROUP:
+            if node.a == 0:
+                try self.compile_node(node.first_child, out)
+            else:
+                var open = Inst(op = OP_SAVE)
+                open.x = 2 * node.a
+                discard(try out.push(open))
+                try self.compile_node(node.first_child, out)
+                var shut = Inst(op = OP_SAVE)
+                shut.x = 2 * node.a + 1
+                discard(try out.push(shut))
+        elif kind == K_REPEAT:
+            try self.compile_repeat(ni, out)
+        elif kind == K_BACKREF:
+            var inst = Inst(op = OP_BACKREF)
+            inst.x = node.a
+            discard(try out.push(inst))
+        elif kind == K_LOOK:
+            var sub = Vec[Inst]()
+            try self.compile_node(node.first_child, &sub)
+            discard(try sub.push(Inst(op = OP_MATCH)))
+            let plen = sub.used
+            let arr = try alloc Inst[plen] in memory.heap
+            var i: usize = 0
+            while i < plen:
+                arr[i] = sub.data[i]
+                i += 1
+            sub.free_all()
+            var prog = Program()
+            prog.code = arr
+            prog.length = plen
+            let sidx = try self.subprogs.push(prog)
+            var inst = Inst(op = OP_LOOK)
+            inst.x = (i32)sidx
+            inst.ahead = node.ahead
+            inst.negate = node.negate
+            discard(try out.push(inst))
+        # K_EMPTY and anything else emit nothing.
+
+    mutating func compile_alt(ni: i32, out: Vec[Inst]*) -> !:
+        let node = self.nodes.data[(usize)ni]
+        var jumps = Vec[i32]()
+        var child = node.first_child
+        while child != -1:
+            let nxt = self.nodes.data[(usize)child].next_sibling
+            if nxt != -1:
+                let si = try out.push(Inst(op = OP_SPLIT))
+                out.data[si].x = (i32)out.used
+                try self.compile_node(child, out)
+                let ji = try out.push(Inst(op = OP_JMP))
+                discard(try jumps.push((i32)ji))
+                out.data[si].y = (i32)out.used
+            else:
+                try self.compile_node(child, out)
+            child = nxt
+        let end = (i32)out.used
+        var k: usize = 0
+        while k < jumps.used:
+            out.data[(usize)jumps.data[k]].x = end
+            k += 1
+        jumps.free_all()
+
+    mutating func compile_repeat(ni: i32, out: Vec[Inst]*) -> !:
+        let node = self.nodes.data[(usize)ni]
+        let child = node.first_child
+        let lo = node.a
+        let hi = node.b
+        var i: i32 = 0
+        while i < lo:
+            try self.compile_node(child, out)
+            i += 1
+        if hi < 0:
+            let mi = try out.push(Inst(op = OP_MARK))
+            let slot = self.mark_count
+            self.mark_count += 1
+            out.data[mi].x = slot
+            let loop_top = (i32)mi
+            let si = try out.push(Inst(op = OP_SPLIT))
+            if node.greedy:
+                out.data[si].x = (i32)out.used
+            else:
+                out.data[si].y = (i32)out.used
+            try self.compile_node(child, out)
+            var guard = Inst(op = OP_PROGRESS)
+            guard.x = slot
+            discard(try out.push(guard))
+            var jump = Inst(op = OP_JMP)
+            jump.x = loop_top
+            discard(try out.push(jump))
+            if node.greedy:
+                out.data[si].y = (i32)out.used
+            else:
+                out.data[si].x = (i32)out.used
+        else:
+            var splits = Vec[i32]()
+            var k: i32 = 0
+            while k < hi - lo:
+                let si = try out.push(Inst(op = OP_SPLIT))
+                discard(try splits.push((i32)si))
+                if node.greedy:
+                    out.data[si].x = (i32)out.used
+                else:
+                    out.data[si].y = (i32)out.used
+                try self.compile_node(child, out)
+                k += 1
+            let end = (i32)out.used
+            var j: usize = 0
+            while j < splits.used:
+                let si = (usize)splits.data[j]
+                if node.greedy:
+                    out.data[si].y = end
+                else:
+                    out.data[si].x = end
+                j += 1
+            splits.free_all()
+
+    # -- first-character filter ----------------------------------------------------------------
+
+    mutating func compute_first() -> !:
+        let plen = self.code.used
+        let seen = try alloc bool[plen] in memory.heap
+        var i: usize = 0
+        while i < plen:
+            seen[i] = false
+            i += 1
+        var stack = Vec[i32]()
+        discard(try stack.push(0))
+        var bail = false
+        while stack.used > 0 and not bail:
+            let pc = stack.data[stack.used - 1]
+            stack.used -= 1
+            if pc < 0 or (usize)pc >= plen or seen[(usize)pc]:
+                continue
+            seen[(usize)pc] = true
+            let inst = self.code.data[(usize)pc]
+            let op = inst.op
+            if op == OP_SAVE or op == OP_ASSERT or op == OP_MARK or op == OP_PROGRESS:
+                discard(try stack.push(pc + 1))
+            elif op == OP_JMP:
+                discard(try stack.push(inst.x))
+            elif op == OP_SPLIT:
+                discard(try stack.push(inst.x))
+                discard(try stack.push(inst.y))
+            elif op == OP_CHAR:
+                if not self.first_has(inst.ch):
+                    discard(try self.first_chars.push(inst.ch))
+            elif op == OP_CLASS:
+                discard(try self.first_classes.push(inst.x))
+            else:
+                self.first_any = true
+                bail = true
+        free(seen) in memory.heap
+        stack.free_all()
+
+    func first_has(cp: u32) -> bool:
+        var i: usize = 0
+        while i < self.first_chars.used:
+            if self.first_chars.data[i] == cp:
+                return true
+            i += 1
+        return false
+
+    func first_ok(ch: u32) -> bool:
+        var i: usize = 0
+        while i < self.first_chars.used:
+            if self.eq(ch, self.first_chars.data[i]):
+                return true
+            i += 1
+        var j: usize = 0
+        while j < self.first_classes.used:
+            if self.class_ok((usize)self.first_classes.data[j], ch):
+                return true
+            j += 1
+        return false
+
+    # -- matching ------------------------------------------------------------------------------
+
+    ## Whether the pattern uses `\G`, whose match depends on the anchor. A caller caching a
+    ## pattern's match across positions must re-run such a pattern rather than reuse the result.
+    pub func uses_g() -> bool:
+        return self.has_g
+
+    ## The leftmost match at or after `offset` over `subject` (a codepoint array), or false.
+    ## `anchor` is the position `\G` asserts. Sets the last-match state on success.
+    pub mutating func search(subject: const u32[], offset: i32, anchor: i32) -> bool:
+        self.subj = subject
+        self.len = (i32)subject.length
+        self.anchor = anchor
+        var at = offset
+        while at <= self.len:
+            if not self.first_any:
+                if at >= self.len or not self.first_ok(self.subj[(usize)at]):
+                    at += 1
+                    continue
+            self.reset()
+            let end = self.run_prog(self.code.data[..<self.code.used], at, -1, &self.bt_pc, &self.bt_sp, &self.bt_log, &self.log_slot, &self.log_val)
+            if end >= 0:
+                self.caps[0] = at
+                self.caps[1] = end
+                return true
+            at += 1
+        return false
+
+    ## A match anchored exactly at `pos` (no scanning), or false.
+    pub mutating func match_at(subject: const u32[], pos: i32, anchor: i32) -> bool:
+        self.subj = subject
+        self.len = (i32)subject.length
+        self.anchor = anchor
+        self.reset()
+        let end = self.run_prog(self.code.data[..<self.code.used], pos, -1, &self.bt_pc, &self.bt_sp, &self.bt_log, &self.log_slot, &self.log_val)
+        if end >= 0:
+            self.caps[0] = pos
+            self.caps[1] = end
+            return true
+        return false
+
+    ## The leftmost match at or after codepoint `offset` in `text`, or false. Convenience for
+    ## `str` callers; decodes into a reused buffer.
+    pub mutating func find(text: str, offset: i32, anchor: i32) -> bool:
+        self.text_subj.used = 0
+        decode_subj(text, &self.text_subj) catch failure:
+            return false
+        return self.search(self.text_subj.data[..<self.text_subj.used], offset, anchor)
+
+    mutating func reset():
+        self.steps = 0
+        var i: usize = 0
+        while i < self.caps.length:
+            self.caps[i] = -1
+            i += 1
+
+    ## Run `code` from `sp0` by iterative backtracking: a stack of (pc, sp, save-log length)
+    ## restore points and a save-log of overwritten capture slots unwound on backtrack. Returns
+    ## the end position on success (== `want_end` when that is not -1, for a lookbehind that must
+    ## end exactly there), or -1.
+    mutating func run_prog(code: const Inst[], sp0: i32, want_end: i32, bt_pc: Vec[i32]*, bt_sp: Vec[i32]*, bt_log: Vec[i32]*, log_slot: Vec[i32]*, log_val: Vec[i32]*) -> i32:
+        var bt: usize = 0
+        var log: usize = 0
+        var pc: i32 = 0
+        var sp: i32 = sp0
+        while true:
+            self.steps += 1
+            if self.steps > self.budget:
+                return -1
+            let inst = code[(usize)pc]
+            let op = inst.op
+            if op == OP_CHAR:
+                if sp < self.len and self.eq(self.subj[(usize)sp], inst.ch):
+                    sp += 1
+                    pc += 1
+                    continue
+            elif op == OP_ANY:
+                if sp < self.len and (self.dotall or self.subj[(usize)sp] != (u32)'\n'):
+                    sp += 1
+                    pc += 1
+                    continue
+            elif op == OP_CLASS:
+                if sp < self.len and self.class_ok((usize)inst.x, self.subj[(usize)sp]):
+                    sp += 1
+                    pc += 1
+                    continue
+            elif op == OP_ASSERT:
+                if self.anchor_ok((u8)inst.x, sp):
+                    pc += 1
+                    continue
+            elif op == OP_SAVE:
+                log_slot.put(log, inst.x)
+                log_val.put(log, self.caps[(usize)inst.x])
+                log += 1
+                self.caps[(usize)inst.x] = sp
+                pc += 1
+                continue
+            elif op == OP_JMP:
+                pc = inst.x
+                continue
+            elif op == OP_SPLIT:
+                bt_pc.put(bt, inst.y)
+                bt_sp.put(bt, sp)
+                bt_log.put(bt, (i32)log)
+                bt += 1
+                pc = inst.x
+                continue
+            elif op == OP_MARK:
+                self.marks[(usize)inst.x] = sp
+                pc += 1
+                continue
+            elif op == OP_PROGRESS:
+                if sp != self.marks[(usize)inst.x]:
+                    pc += 1
+                    continue
+            elif op == OP_BACKREF:
+                let ne = self.backref_end(inst.x, sp)
+                if ne >= 0:
+                    sp = ne
+                    pc += 1
+                    continue
+            elif op == OP_LOOK:
+                if self.run_look(inst, sp):
+                    pc += 1
+                    continue
+            elif op == OP_MATCH:
+                if want_end < 0 or sp == want_end:
+                    return sp
+            if bt == 0:
+                return -1
+            bt -= 1
+            pc = bt_pc.data[bt]
+            sp = bt_sp.data[bt]
+            let ll = (usize)bt_log.data[bt]
+            while log > ll:
+                log -= 1
+                self.caps[(usize)log_slot.data[log]] = log_val.data[log]
+        return -1
+
+    ## A lookaround: run its subprogram (captures are discarded), possibly negated.
+    mutating func run_look(inst: Inst, sp: i32) -> bool:
+        let prog = self.subprogs.data[(usize)inst.x]
+        var snap = Vec[i32]()
+        var s: usize = 0
+        while s < self.caps.length:
+            discard(snap.push(self.caps[s]) catch failure: trap("out of memory in regex vm"))
+            s += 1
+        var bt_pc = Vec[i32]()
+        var bt_sp = Vec[i32]()
+        var bt_log = Vec[i32]()
+        var log_slot = Vec[i32]()
+        var log_val = Vec[i32]()
+        var ok = false
+        if inst.ahead:
+            ok = self.run_prog(prog.code[..<prog.length], sp, -1, &bt_pc, &bt_sp, &bt_log, &log_slot, &log_val) >= 0
+        else:
+            let limit: i32 = sp - 256 if sp > 256 else 0
+            var pos = sp
+            while pos >= limit:
+                if self.run_prog(prog.code[..<prog.length], pos, sp, &bt_pc, &bt_sp, &bt_log, &log_slot, &log_val) >= 0:
+                    ok = true
+                    break
+                pos -= 1
+        var r: usize = 0
+        while r < self.caps.length:
+            self.caps[r] = snap.data[r]
+            r += 1
+        snap.free_all()
+        bt_pc.free_all()
+        bt_sp.free_all()
+        bt_log.free_all()
+        log_slot.free_all()
+        log_val.free_all()
+        if inst.negate:
+            return not ok
+        return ok
+
+    ## Match a backreference at `sp`: the new position on success, or -1. An unset group matches
+    ## the empty string.
+    func backref_end(idx: i32, sp: i32) -> i32:
+        let ei = 2 * idx + 1
+        if idx < 0 or ei >= (i32)self.caps.length:
+            return sp
+        let cs = self.caps[(usize)(2 * idx)]
+        let ce = self.caps[(usize)ei]
+        if cs < 0 or ce < 0:
+            return sp
+        let n = ce - cs
+        if sp + n > self.len:
+            return -1
+        var k: i32 = 0
+        while k < n:
+            if not self.eq(self.subj[(usize)(sp + k)], self.subj[(usize)(cs + k)]):
+                return -1
+            k += 1
+        return sp + n
+
+    # -- character tests -----------------------------------------------------------------------
+
+    func eq(a: u32, b: u32) -> bool:
+        if a == b:
+            return true
+        if self.ic:
+            return swapcase(a) == b
+        return false
+
+    func class_ok(ci: usize, ch: u32) -> bool:
+        let cls = self.classes.data[ci]
+        return self.class_hit(cls, ch) != cls.negate
+
+    func class_hit(cls: CharClass, ch: u32) -> bool:
+        let b = cls.builtins
+        if (b & B_d) != 0 and is_digit(ch):
+            return true
+        if (b & B_D) != 0 and not is_digit(ch):
+            return true
+        if (b & B_w) != 0 and is_word(ch):
+            return true
+        if (b & B_W) != 0 and not is_word(ch):
+            return true
+        if (b & B_s) != 0 and is_space(ch):
+            return true
+        if (b & B_S) != 0 and not is_space(ch):
+            return true
+        if (b & B_h) != 0 and is_hex(ch):
+            return true
+        if (b & B_H) != 0 and not is_hex(ch):
+            return true
+        var j: usize = 0
+        while j < cls.range_count:
+            let lo = self.ranges.data[cls.range_start + 2 * j]
+            let hi = self.ranges.data[cls.range_start + 2 * j + 1]
+            if self.in_range(ch, lo, hi):
+                return true
+            j += 1
+        return false
+
+    func in_range(ch: u32, lo: u32, hi: u32) -> bool:
+        if lo <= ch and ch <= hi:
+            return true
+        if self.ic:
+            let s = swapcase(ch)
+            if s != ch and lo <= s and s <= hi:
+                return true
+        return false
+
+    func anchor_ok(kind: u8, pos: i32) -> bool:
+        if kind == AN_BOL:
+            return pos == 0 or (self.multi and pos > 0 and self.subj[(usize)(pos - 1)] == (u32)'\n')
+        if kind == AN_EOL:
+            return pos == self.len or (self.multi and pos < self.len and self.subj[(usize)pos] == (u32)'\n')
+        if kind == AN_WORDB:
+            return self.word_at(pos - 1) != self.word_at(pos)
+        if kind == AN_NWORDB:
+            return self.word_at(pos - 1) == self.word_at(pos)
+        if kind == AN_BUFS:
+            return pos == 0
+        if kind == AN_G:
+            return pos == self.anchor
+        if kind == AN_BUFE:
+            return pos == self.len
+        return false
+
+    func word_at(i: i32) -> bool:
+        return i >= 0 and i < self.len and is_word(self.subj[(usize)i])
+
+    # -- match accessors -----------------------------------------------------------------------
+
+    ## The whole-match start offset (a codepoint index).
+    pub func match_start() -> i32:
+        return self.caps[0]
+
+    ## The whole-match end offset (a codepoint index).
+    pub func match_end() -> i32:
+        return self.caps[1]
+
+    ## The number of groups, including group 0 (the whole match).
+    pub func group_count() -> i32:
+        return (i32)(self.caps.length // 2)
+
+    ## The start of capturing group `index`, or -1 when unset.
+    pub func group_start(index: i32) -> i32:
+        if index >= 0 and (usize)(2 * index + 1) < self.caps.length:
+            return self.caps[(usize)(2 * index)]
+        return -1
+
+    ## The end of capturing group `index`, or -1 when unset.
+    pub func group_end(index: i32) -> i32:
+        if index >= 0 and (usize)(2 * index + 1) < self.caps.length:
+            return self.caps[(usize)(2 * index + 1)]
+        return -1
+
+    ## The index of a named group, or -1 when the pattern has no such name.
+    pub func group_of(name: str) -> i32:
+        var query = Vec[u32]()
+        decode_subj(name, &query) catch failure:
+            query.free_all()
+            return -1
+        var result: i32 = -1
+        var i: usize = 0
+        while i < self.names.used and result < 0:
+            let entry = self.names.data[i]
+            if (usize)entry.len == query.used and self.pool_eq(entry.start, query):
+                result = entry.group
+            i += 1
+        query.free_all()
+        return result
+
+    func pool_eq(start: i32, query: Vec[u32]) -> bool:
+        var i: usize = 0
+        while i < query.used:
+            if self.name_cps.data[(usize)start + i] != query.data[i]:
+                return false
+            i += 1
+        return true
+
+    # -- teardown ------------------------------------------------------------------------------
+
+    ## Release every allocation the pattern holds.
+    pub mutating func close():
+        self.dispose()
+
+    mutating func dispose():
+        self.pat.free_all()
+        self.nodes.free_all()
+        self.name_cps.free_all()
+        self.names.free_all()
+        self.classes.free_all()
+        self.ranges.free_all()
+        self.code.free_all()
+        var i: usize = 0
+        while i < self.subprogs.used:
+            let prog = self.subprogs.data[i]
+            if prog.code.length > 0:
+                free(prog.code) in memory.heap
+            i += 1
+        self.subprogs.free_all()
+        self.first_chars.free_all()
+        self.first_classes.free_all()
+        self.bt_pc.free_all()
+        self.bt_sp.free_all()
+        self.bt_log.free_all()
+        self.log_slot.free_all()
+        self.log_val.free_all()
+        self.text_subj.free_all()
+        if self.marks.length > 0:
+            free(self.marks) in memory.heap
+        if self.caps.length > 0:
+            free(self.caps) in memory.heap
+        var empty: i32[]
+        self.marks = empty
+        self.caps = empty
+
+    static func own(native: Regex*) -> interop.Reference[Regex]!:
+        return try interop.Reference[Regex].adopt(native, regex_type)
+
+## The interop type of a compiled `Regex`.
+pub let regex_type: interop.Type[Regex] = interop.Type[Regex]("regex", Regex.close, closeable = true)
+
+## Compile `pattern` into an owned reference. `ignore_case` starts it case-insensitive.
+pub func compile(pattern: str, ignore_case: bool = false) -> interop.Reference[Regex]!:
+    let native = try new Regex(pattern, ignore_case)
+    return try Regex.own(native)
+
+# mark: Free helpers ==========================================================================
+
+## Decode `text` into a codepoint array. Invalid bytes pass through as their own value.
+pub func decode_subj(text: str, out: Vec[u32]*) -> !:
+    let bytes = text.bytes
+    var offset: usize = 0
+    while offset < bytes.length:
+        if let decoded = utf8.decode(bytes, offset):
+            discard(try out.push((u32)decoded.scalar))
+            offset += decoded.width
+        else:
+            discard(try out.push((u32)bytes[offset]))
+            offset += 1
+
+func is_builtin(c: u32) -> bool:
+    return c == (u32)'d' or c == (u32)'D' or c == (u32)'w' or c == (u32)'W' or c == (u32)'s' or c == (u32)'S' or c == (u32)'h' or c == (u32)'H'
+
+func builtin_bit(c: u32) -> u32:
+    if c == (u32)'d':
+        return B_d
+    if c == (u32)'D':
+        return B_D
+    if c == (u32)'w':
+        return B_w
+    if c == (u32)'W':
+        return B_W
+    if c == (u32)'s':
+        return B_s
+    if c == (u32)'S':
+        return B_S
+    if c == (u32)'h':
+        return B_h
+    return B_H
+
+func is_digit(ch: u32) -> bool:
+    return ch >= (u32)'0' and ch <= (u32)'9'
+
+func is_word(ch: u32) -> bool:
+    return is_digit(ch) or (ch >= (u32)'a' and ch <= (u32)'z') or (ch >= (u32)'A' and ch <= (u32)'Z') or ch == (u32)'_'
+
+func is_space(ch: u32) -> bool:
+    return ch == (u32)' ' or ch == (u32)'\t' or ch == (u32)'\n' or ch == (u32)'\r' or ch == 11 or ch == 12
+
+func is_hex(ch: u32) -> bool:
+    return is_digit(ch) or (ch >= (u32)'a' and ch <= (u32)'f') or (ch >= (u32)'A' and ch <= (u32)'F')
+
+func hex_digit(cp: u32) -> i32:
+    if cp >= (u32)'0' and cp <= (u32)'9':
+        return (i32)(cp - (u32)'0')
+    if cp >= (u32)'a' and cp <= (u32)'f':
+        return (i32)(cp - (u32)'a') + 10
+    if cp >= (u32)'A' and cp <= (u32)'F':
+        return (i32)(cp - (u32)'A') + 10
+    return 0
+
+func swapcase(ch: u32) -> u32:
+    if ch >= (u32)'A' and ch <= (u32)'Z':
+        return ch + 32
+    if ch >= (u32)'a' and ch <= (u32)'z':
+        return ch - 32
+    return ch
+
+# mark: Tests =================================================================================
+
+func span_is(pattern: str, text: str, s: i32, e: i32) -> bool!:
+    var result = false
+    with memory.heap:
+        let re = try new Regex(pattern, false)
+        defer free(re)
+        defer re.close()
+        let matched = re.find(text, 0, 0)
+        if s < 0:
+            result = not matched
+        else:
+            result = matched and re.match_start() == s and re.match_end() == e
+    return result
+
+func span_is_ic(pattern: str, text: str, s: i32, e: i32) -> bool!:
+    var result = false
+    with memory.heap:
+        let re = try new Regex(pattern, true)
+        defer free(re)
+        defer re.close()
+        let matched = re.find(text, 0, 0)
+        if s < 0:
+            result = not matched
+        else:
+            result = matched and re.match_start() == s and re.match_end() == e
+    return result
+
+func group_is(pattern: str, text: str, index: i32, s: i32, e: i32) -> bool!:
+    var result = false
+    with memory.heap:
+        let re = try new Regex(pattern, false)
+        defer free(re)
+        defer re.close()
+        let matched = re.find(text, 0, 0)
+        result = matched and re.group_start(index) == s and re.group_end(index) == e
+    return result
+
+test "regex literals, classes and anchors":
+    assert(try span_is("abc", "xxabcyy", 2, 5))
+    assert(try span_is("a.c", "zza-cw", 2, 5))
+    assert(try span_is("[0-9]+", "abc123def", 3, 6))
+    assert(try span_is("[^0-9]+", "12ab34", 2, 4))
+    assert(try span_is("\\d+", "x42", 1, 3))
+    assert(try span_is("\\w+", " abc_1 ", 1, 6))
+    assert(try span_is("[\\w.]+", "a.b c", 0, 3))
+    assert(try span_is("^abc", "abcx", 0, 3))
+    assert(try span_is("^abc", "xabc", -1, -1))
+    assert(try span_is("abc$", "abc", 0, 3))
+    assert(try span_is("abc$", "abcd", -1, -1))
+    assert(try span_is("a\\.b", "a.b", 0, 3))
+    assert(try span_is("a\\.b", "axb", -1, -1))
+    assert(try span_is("", "abc", 0, 0))
+    assert(try span_is("[[:digit:]]+", "ab12", 2, 4))
+
+test "regex alternation, quantifiers and word boundaries":
+    assert(try span_is("a|bb|ccc", "zzccc", 2, 5))
+    assert(try span_is("ab{2,3}c", "abbbc", 0, 5))
+    assert(try span_is("ab{2,3}c", "abc", -1, -1))
+    assert(try span_is("ab{2}c", "abbc", 0, 4))
+    assert(try span_is("\\bcat\\b", "a cat!", 2, 5))
+    assert(try span_is("\\bcat\\b", "concatenate", -1, -1))
+    assert(try group_is("a(.*?)b", "axxbxxb", 1, 1, 3))
+    assert(try group_is("a(.*)b", "axxbxxb", 1, 1, 6))
+
+test "regex groups, backrefs and lookaround":
+    assert(try group_is("(ab)+", "ababab", 1, 4, 6))
+    assert(try group_is("(?<word>\\w+)", "  hey ", 1, 2, 5))
+    assert(try span_is("(ab)\\1", "abab", 0, 4))
+    assert(try span_is("(ab)\\1", "abcd", -1, -1))
+    assert(try span_is("foo(?=bar)", "foobar", 0, 3))
+    assert(try span_is("foo(?=bar)", "foobaz", -1, -1))
+    assert(try span_is("foo(?!bar)", "foobaz", 0, 3))
+    assert(try span_is("foo(?!bar)", "foobar", -1, -1))
+    assert(try span_is("(?<=@)\\w+", "hi @name", 4, 8))
+    assert(try span_is_ic("abc", "XXABCyy", 2, 5))
+    assert(try span_is("abc", "ABC", -1, -1))
