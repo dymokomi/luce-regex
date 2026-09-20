@@ -48,6 +48,7 @@ let AN_BUFE = 6
 let digits10 = "0123456789"
 let UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 let LOWER = "abcdefghijklmnopqrstuvwxyz"
+let ASCII_CTRL = "\u{0}\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{e}\u{f}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1a}\u{1b}\u{1c}\u{1d}\u{1e}\u{1f}"
 let ASCII_PRINT = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
 # mark: The AST and continuation ==============================================================
@@ -880,7 +881,7 @@ func is_word(ch: str) -> bool:
     return is_digit(ch) or ("a" <= ch and ch <= "z") or ("A" <= ch and ch <= "Z") or ch == "_"
 
 func is_space(ch: str) -> bool:
-    return ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+    return ch == " " or ch == "\t" or ch == "\n" or ch == "\r" or ch == "\u{b}" or ch == "\u{c}"
 
 func is_hex(ch: str) -> bool:
     return is_digit(ch) or ("a" <= ch and ch <= "f") or ("A" <= ch and ch <= "F")
@@ -927,22 +928,17 @@ func swapcase(ch: str) -> str:
         return UPPER[l..<l + 1]
     return ch
 
-## The one-scalar string for a codepoint. The printable ASCII range comes from a table; NUL and
-## the whitespace controls are the escapes the Base emitter accepts in a `str`. Every other
-## control scalar and any codepoint of 128 or more returns "" — a char that matches nothing —
-## until a runtime scalar builder lands (the Luce emitter spells other controls as byte escapes,
-## which Base rejects in a text literal). See the README.
+## The one-scalar string for a codepoint. The ASCII range comes from tables; a codepoint of 128
+## or more returns "" (a char that matches nothing) until a runtime scalar builder lands.
 func cp_to_str(cp: int) -> str:
-    if cp == 9:
-        return "\t"
-    if cp == 10:
-        return "\n"
-    if cp == 13:
-        return "\r"
-    if cp == 0:
-        return "\u{0}"
-    if cp >= 32 and cp < 127:
+    if cp < 0:
+        return ""
+    if cp < 32:
+        return ASCII_CTRL[cp..<cp + 1]
+    if cp < 127:
         return ASCII_PRINT[cp - 32..<cp - 31]
+    if cp == 127:
+        return "\u{7f}"
     return ""
 
 # mark: Tests =================================================================================
