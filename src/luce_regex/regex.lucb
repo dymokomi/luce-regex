@@ -1261,10 +1261,13 @@ pub struct Regex:
         return false
 
     func anchor_ok(kind: u8, pos: i32) -> bool:
+        # `^` and `$` are line anchors, as in Oniguruma / Ruby (the flavour TextMate grammars target):
+        # they match at every line boundary, not only at the ends of the subject. The tokenizer feeds
+        # one line at a time (with its trailing newline), so `$` also matches just before that newline.
         if kind == AN_BOL:
-            return pos == 0 or (self.multi and pos > 0 and self.subj[(usize)(pos - 1)] == (u32)'\n')
+            return pos == 0 or (pos > 0 and self.subj[(usize)(pos - 1)] == (u32)'\n')
         if kind == AN_EOL:
-            return pos == self.len or (self.multi and pos < self.len and self.subj[(usize)pos] == (u32)'\n')
+            return pos == self.len or (pos < self.len and self.subj[(usize)pos] == (u32)'\n')
         if kind == AN_WORDB:
             return self.word_at(pos - 1) != self.word_at(pos)
         if kind == AN_NWORDB:
