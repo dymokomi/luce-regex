@@ -147,6 +147,7 @@ pub class Regex:
     var caps: list[int]
     var steps: int
     var budget: int
+    var has_g: bool
 
     ## Compile `pattern`. `ignore_case` starts the whole pattern case-insensitive; an inline
     ## `(?i)` has the same effect. A malformed pattern fails with `syntax_error`.
@@ -166,6 +167,7 @@ pub class Regex:
         self.anchor = 0
         self.steps = 0
         self.budget = 200000
+        self.has_g = false
         self.root = Node(K_EMPTY)
         self.prog = Node(K_PROGRESS)
         self.endat = Node(K_ENDAT)
@@ -406,6 +408,7 @@ pub class Regex:
         if c == "A":
             return Node(K_ANCHOR, a = AN_BUFS)
         if c == "G":
+            self.has_g = true
             return Node(K_ANCHOR, a = AN_G)
         if c == "z" or c == "Z":
             return Node(K_ANCHOR, a = AN_BUFE)
@@ -628,6 +631,11 @@ pub class Regex:
                 break
 
     # -- matching ------------------------------------------------------------------------------
+
+    ## Whether the pattern uses `\G`, whose match depends on the anchor. A caller that caches a
+    ## pattern's match across positions must re-run such a pattern rather than reuse the result.
+    pub func uses_g(self) -> bool:
+        return self.has_g
 
     ## The leftmost match at or after `offset`, or none. `anchor` is the position `\G` asserts.
     pub func search(self, subject: list[str], offset: int, anchor: int) -> Match?:
