@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-regex" {
     str owner = "dymokomi"
-    str version = "0.1.4"
+    str version = "0.1.5"
     str kind = "package"
     str language = "luce-base"
     str description = "A small, fast, from-scratch regular-expression engine written in luce-base, covering the Oniguruma subset that TextMate grammars use. It depends only on the standard library — there is no external regex."
@@ -9,5 +9,11 @@ def package "luce-regex" {
 
     def export "regex" {
         str module = "luce_regex.regex"
+    }
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-std"
     }
 }
