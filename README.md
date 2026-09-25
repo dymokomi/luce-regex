@@ -11,7 +11,7 @@ The VM is generic over the subject, so each dialect and buffer width gets its ow
 monomorphised loop; the hot loop is integer comparisons and allocates nothing per step once
 its stacks are warm.
 
-The package exports two modules: `regex` (`luce_regex.regex`, the engine) and `unicode`
+The package exports two modules: `regex` (`luce_regex.regex`, the engine) and `libunicode`
 (`luce_regex.unicode`, QuickJS's libunicode ported to luce-base: character ranges, case
 conversion and folding, normalization, general categories, scripts and binary and sequence
 properties; luce-js uses it too).
