@@ -315,7 +315,7 @@ func regex_dispose(re: Regex*):
     re.caps = empty
 
 ## Decode `text` into a codepoint array. Invalid bytes pass through as their own value.
-func decode_subj(text: str, out: Vec[u32]*) -> !:
+pub func decode_subj(text: str, out: Vec[u32]*) -> !:
     let bytes = text.bytes
     var offset: usize = 0
     while offset < bytes.length:

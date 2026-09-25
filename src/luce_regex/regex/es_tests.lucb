@@ -354,3 +354,13 @@ test "exec polls check_timeout and stops when asked":
     # the same program still matches afterwards
     assert(exec8(re, "aaab".bytes, 0, caps, none) == exec_match)
     assert(caps[0] == 0 and caps[1] == 4 and caps[2] == 0 and caps[3] == 3)
+
+test "the README example":
+    var message: u8[128]
+    let re = compile_ecmascript("(?<year>\\d{4})-(?<month>\\d{2})".bytes, es_unicode, message, none) else trap("syntax error")
+    defer free_ecmascript(re)
+    var captures: i32[6]
+    assert(exec8(re, "on 2024-05-01".bytes, 0, captures, none) == exec_match)
+    assert(captures[0] == 3 and captures[1] == 10 and captures[2] == 3 and captures[3] == 7)
+    assert(captures[4] == 8 and captures[5] == 10)
+    assert(re.group_of("month") == 2)
