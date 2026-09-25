@@ -153,6 +153,22 @@ func parse_class_string_disjunction(ps: EsParse*, s: StrSet*) -> !:
 
 # mark: Class atoms ============================================================================
 
+# The ClassSetReservedDoublePunctuator characters of the v flag.
+func is_double_forbidden(c: u8) -> bool:
+    match c:
+        '&', '!', '#', '$', '%', '*', '+', ',', '.', ':', ';', '<', '=', '>', '?', '@', '^', '`', '~':
+            return true
+        _:
+            return false
+
+# The ClassSetSyntaxCharacter characters of the v flag, which must be escaped.
+func is_set_syntax(c: u8) -> bool:
+    match c:
+        '(', ')', '[', ']', '{', '}', '/', '-', '|':
+            return true
+        _:
+            return false
+
 func invalid_escape(ps: EsParse*) -> i32!:
     return try es_fail(ps, "invalid escape sequence in regular expression")
 
@@ -206,8 +222,8 @@ func get_class_atom(ps: EsParse*, s: StrSet*?, inclass: bool) -> i32!:
                 if not inclass and ps.is_unicode:
                     return try invalid_escape(ps)
             '^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '/':
-                # always valid to escape these characters
-                c = c
+                # always valid to escape these characters: the character itself
+                default_escape = false
             'p', 'P':
                 default_escape = true
                 if let set = s:
@@ -247,17 +263,13 @@ func get_class_atom(ps: EsParse*, s: StrSet*?, inclass: bool) -> i32!:
             return try es_fail(ps, "unexpected end")
         normal_char = true
     else:
-        match c0:
-            '&', '!', '#', '$', '%', '*', '+', ',', '.', ':', ';', '<', '=', '>', '?', '@', '^', '`', '~':
-                if ps.unicode_sets and ch_at(ps, ps.p + 1) == c0:
-                    # forbidden double characters
-                    return try es_fail(ps, "invalid class set operation in regular expression")
-            '(', ')', '[', ']', '{', '}', '/', '-', '|':
-                if ps.unicode_sets:
-                    # invalid characters in unicode sets
-                    return try es_fail(ps, "invalid character in class in regular expression")
-            _:
-                c = c
+        if ps.unicode_sets:
+            if is_double_forbidden(c0) and ch_at(ps, ps.p + 1) == c0:
+                # forbidden double characters
+                return try es_fail(ps, "invalid class set operation in regular expression")
+            if is_set_syntax(c0):
+                # invalid characters in unicode sets
+                return try es_fail(ps, "invalid character in class in regular expression")
         normal_char = true
     if normal_char:
         if c >= 128:

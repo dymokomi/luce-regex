@@ -149,14 +149,14 @@ func atom_analysis(body: const Vec[Inst]*) -> (bool, bool):
     var i: usize = 0
     while i < body.used:
         let op = body.data[i].op
-        if op == OP_CHAR or op == OP_CHAR_I or op == OP_DOT or op == OP_ANY_ALL or op == OP_RANGE or op == OP_RANGE_I:
+        let consumes = op == OP_CHAR or op == OP_CHAR_I or op == OP_DOT or op == OP_ANY_ALL or op == OP_RANGE or op == OP_RANGE_I
+        # instructions with no effect on either question
+        let neutral = op == OP_ASSERT or op == OP_SET_REG or op == OP_SET_POS or op == OP_PREV or op == OP_SAVE or op == OP_SAVE_RESET
+        if consumes:
             need_check_adv = false
-        elif op == OP_ASSERT or op == OP_SET_REG or op == OP_SET_POS or op == OP_PREV or op == OP_SAVE or op == OP_SAVE_RESET:
-            # no effect
-            need_check_adv = need_check_adv
         elif op == OP_BACKREF_ES:
             need_capture_init = true
-        else:
+        elif not neutral:
             # safe behavior: we cannot predict the outcome
             need_capture_init = true
             break
