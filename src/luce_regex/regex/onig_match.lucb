@@ -1,0 +1,232 @@
+#==============================================================================================
+#
+#   onig_match - Oniguruma matching: the search loop and the character tests
+#
+#   DESCRIPTION:
+#       The search runs the program at each start position the first-character filter
+#       admits. `^` and `$` are line anchors, as in Oniguruma / Ruby (the flavour TextMate
+#       grammars target). Case-insensitive matching is ASCII case swapping. A lookaround runs
+#       its subprogram on fresh stacks and discards the captures it set; a lookbehind tries
+#       the start positions up to 256 back that end exactly at the current position.
+#
+#==============================================================================================
+
+# mark: Search =================================================================================
+
+func onig_search(re: Regex*, subject: const u32[], offset: i32, anchor: i32) -> bool:
+    let src = CodePoints(data = subject)
+    re.len = (i32)subject.length
+    re.anchor = anchor
+    var at = offset
+    while at <= re.len:
+        if not re.first_any:
+            if at >= re.len or not first_ok(re, subject[(usize)at]):
+                at += 1
+                continue
+        onig_reset(re)
+        let end = run_prog(re, &src, re.code.data[..<re.code.used], at, -1, &re.stacks)
+        if end >= 0:
+            re.caps[0] = at
+            re.caps[1] = end
+            return true
+        if end == RUN_NO_MEMORY:
+            trap("out of memory in regex vm")
+        at += 1
+    return false
+
+func onig_match_at(re: Regex*, subject: const u32[], pos: i32, anchor: i32) -> bool:
+    let src = CodePoints(data = subject)
+    re.len = (i32)subject.length
+    re.anchor = anchor
+    onig_reset(re)
+    let end = run_prog(re, &src, re.code.data[..<re.code.used], pos, -1, &re.stacks)
+    if end >= 0:
+        re.caps[0] = pos
+        re.caps[1] = end
+        return true
+    if end == RUN_NO_MEMORY:
+        trap("out of memory in regex vm")
+    return false
+
+func onig_reset(re: Regex*):
+    re.steps = 0
+    var i: usize = 0
+    while i < re.caps.length:
+        re.caps[i] = -1
+        i += 1
+
+## A lookaround: run its subprogram (captures are discarded), possibly negated.
+func onig_run_look[S: Units](re: Regex*, src: const S*, inst: Inst, sp: i32) -> bool:
+    let prog = re.subprogs.data[(usize)inst.x]
+    var snap = Vec[i32]()
+    var s: usize = 0
+    while s < re.caps.length:
+        discard(snap.push(re.caps[s]) catch failure: trap("out of memory in regex vm"))
+        s += 1
+    var st = stacks_on(Heap())
+    var ok = false
+    if inst.ahead:
+        let r = run_prog(re, src, prog.code[..<prog.length], sp, -1, &st)
+        if r == RUN_NO_MEMORY:
+            trap("out of memory in regex vm")
+        ok = r >= 0
+    else:
+        let limit: i32 = sp - 256 if sp > 256 else 0
+        var pos = sp
+        while pos >= limit:
+            let r = run_prog(re, src, prog.code[..<prog.length], pos, sp, &st)
+            if r == RUN_NO_MEMORY:
+                trap("out of memory in regex vm")
+            if r >= 0:
+                ok = true
+                break
+            pos -= 1
+    var r: usize = 0
+    while r < re.caps.length:
+        re.caps[r] = snap.data[r]
+        r += 1
+    snap.free_all()
+    st.free_all()
+    if inst.negate:
+        return not ok
+    return ok
+
+## Match a backreference at `sp`: the new position on success, or -1. An unset group matches
+## the empty string.
+func backref_end[S: Units](re: const Regex*, src: const S*, idx: i32, sp: i32) -> i32:
+    let ei = 2 * idx + 1
+    if idx < 0 or ei >= 2 * re.ncap:
+        return sp
+    let cs = re.caps[(usize)(2 * idx)]
+    let ce = re.caps[(usize)ei]
+    if cs < 0 or ce < 0:
+        return sp
+    let n = ce - cs
+    if sp + n > re.len:
+        return -1
+    var k: i32 = 0
+    while k < n:
+        if not eq(re, src.next(sp + k), src.next(cs + k)):
+            return -1
+        k += 1
+    return sp + n
+
+# mark: Character tests ========================================================================
+
+func eq(re: const Regex*, a: u32, b: u32) -> bool:
+    if a == b:
+        return true
+    if re.ic:
+        return swapcase(a) == b
+    return false
+
+func class_ok(re: const Regex*, ci: usize, ch: u32) -> bool:
+    let cls = re.classes.data[ci]
+    return class_hit(re, cls, ch) != cls.negate
+
+func class_hit(re: const Regex*, cls: CharClass, ch: u32) -> bool:
+    let b = cls.builtins
+    if (b & B_d) != 0 and is_digit(ch):
+        return true
+    if (b & B_D) != 0 and not is_digit(ch):
+        return true
+    if (b & B_w) != 0 and is_word(ch):
+        return true
+    if (b & B_W) != 0 and not is_word(ch):
+        return true
+    if (b & B_s) != 0 and is_space(ch):
+        return true
+    if (b & B_S) != 0 and not is_space(ch):
+        return true
+    if (b & B_h) != 0 and is_hex(ch):
+        return true
+    if (b & B_H) != 0 and not is_hex(ch):
+        return true
+    var j: usize = 0
+    while j < cls.range_count:
+        let lo = re.ranges.data[cls.range_start + 2 * j]
+        let hi = re.ranges.data[cls.range_start + 2 * j + 1]
+        if in_range(re, ch, lo, hi):
+            return true
+        j += 1
+    return false
+
+func in_range(re: const Regex*, ch: u32, lo: u32, hi: u32) -> bool:
+    if lo <= ch and ch <= hi:
+        return true
+    if re.ic:
+        let s = swapcase(ch)
+        if s != ch and lo <= s and s <= hi:
+            return true
+    return false
+
+func anchor_ok[S: Units](re: const Regex*, src: const S*, kind: u8, pos: i32) -> bool:
+    # `^` and `$` are line anchors, as in Oniguruma / Ruby (the flavour TextMate grammars target):
+    # they match at every line boundary, not only at the ends of the subject. The tokenizer feeds
+    # one line at a time (with its trailing newline), so `$` also matches just before that newline.
+    if kind == AN_BOL:
+        return pos == 0 or (pos > 0 and src.prev(pos) == (u32)'\n')
+    if kind == AN_EOL:
+        return pos == re.len or (pos < re.len and src.next(pos) == (u32)'\n')
+    if kind == AN_WORDB:
+        return word_at(re, src, pos - 1) != word_at(re, src, pos)
+    if kind == AN_NWORDB:
+        return word_at(re, src, pos - 1) == word_at(re, src, pos)
+    if kind == AN_BUFS:
+        return pos == 0
+    if kind == AN_G:
+        return pos == re.anchor
+    if kind == AN_BUFE:
+        return pos == re.len
+    return false
+
+func word_at[S: Units](re: const Regex*, src: const S*, i: i32) -> bool:
+    return i >= 0 and i < re.len and is_word(src.next(i))
+
+func is_builtin(c: u32) -> bool:
+    return c == (u32)'d' or c == (u32)'D' or c == (u32)'w' or c == (u32)'W' or c == (u32)'s' or c == (u32)'S' or c == (u32)'h' or c == (u32)'H'
+
+func builtin_bit(c: u32) -> u32:
+    if c == (u32)'d':
+        return B_d
+    if c == (u32)'D':
+        return B_D
+    if c == (u32)'w':
+        return B_w
+    if c == (u32)'W':
+        return B_W
+    if c == (u32)'s':
+        return B_s
+    if c == (u32)'S':
+        return B_S
+    if c == (u32)'h':
+        return B_h
+    return B_H
+
+func is_digit(ch: u32) -> bool:
+    return ch >= (u32)'0' and ch <= (u32)'9'
+
+func is_word(ch: u32) -> bool:
+    return is_digit(ch) or (ch >= (u32)'a' and ch <= (u32)'z') or (ch >= (u32)'A' and ch <= (u32)'Z') or ch == (u32)'_'
+
+func is_space(ch: u32) -> bool:
+    return ch == (u32)' ' or ch == (u32)'\t' or ch == (u32)'\n' or ch == (u32)'\r' or ch == 11 or ch == 12
+
+func is_hex(ch: u32) -> bool:
+    return is_digit(ch) or (ch >= (u32)'a' and ch <= (u32)'f') or (ch >= (u32)'A' and ch <= (u32)'F')
+
+func hex_digit(cp: u32) -> i32:
+    if cp >= (u32)'0' and cp <= (u32)'9':
+        return (i32)(cp - (u32)'0')
+    if cp >= (u32)'a' and cp <= (u32)'f':
+        return (i32)(cp - (u32)'a') + 10
+    if cp >= (u32)'A' and cp <= (u32)'F':
+        return (i32)(cp - (u32)'A') + 10
+    return 0
+
+func swapcase(ch: u32) -> u32:
+    if ch >= (u32)'A' and ch <= (u32)'Z':
+        return ch + 32
+    if ch >= (u32)'a' and ch <= (u32)'z':
+        return ch - 32
+    return ch

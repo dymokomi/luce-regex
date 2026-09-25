@@ -1,0 +1,205 @@
+#==============================================================================================
+#
+#   es_vm - The backtracking VM of the ECMAScript dialect
+#
+#   DESCRIPTION:
+#       The loop of vm.lucb over the ECMAScript instructions, on the same stacks and save
+#       log, following libregexp.c's lre_exec_backtrack. Counted loops keep their counter
+#       and the position an iteration started at in registers (slots of `caps` after the
+#       capture pairs), so backtracking restores them like captures.
+#
+#       A lookaround runs inline, as QuickJS's does: LOOK_START pushes a marker choice
+#       point; when the body matches, LOOK_MATCH drops every choice point above the marker
+#       (the lookaround is atomic) but keeps the save log, so the captures it set stay set
+#       until an outer backtrack undoes them; NLOOK_MATCH instead unwinds to the marker and
+#       fails. Backtracking into a negative marker means the body failed: the negative
+#       lookaround succeeds and execution resumes after it.
+#
+#       Every `budget` steps (10000) the loop polls the host's interrupt callback.
+#
+#==============================================================================================
+
+# Whether the host asks the running match to stop.
+func timed_out(re: const Regex*) -> bool:
+    if let f = re.check_timeout:
+        return f(re.host_opaque)
+    return false
+
+## Run the ECMAScript program from `sp0`: the end position of a match, or a RUN_* code.
+func es_run[S: Units](re: Regex*, src: const S*, code: const Inst[], sp0: i32, st: Stacks*) -> i32:
+    var bt: usize = 0
+    var log: usize = 0
+    var pc: i32 = 0
+    var sp: i32 = sp0
+    let len = re.len
+    while true:
+        re.steps += 1
+        if re.steps > re.budget:
+            re.steps = 0
+            if timed_out(re):
+                return RUN_INTERRUPTED
+        let inst = code[(usize)pc]
+        let op = inst.op
+        if op == OP_CHAR:
+            if sp < len:
+                let c = src.next(sp)
+                if c == inst.ch:
+                    sp += src.width(c)
+                    pc += 1
+                    continue
+        elif op == OP_ASSERT:
+            if es_anchor_ok(re, src, (u8)inst.x, sp):
+                pc += 1
+                continue
+        elif op == OP_SAVE:
+            if not log_set(re, st, log, inst.x, sp):
+                return RUN_NO_MEMORY
+            log += 1
+            pc += 1
+            continue
+        elif op == OP_JMP:
+            pc = inst.x
+            continue
+        elif op == OP_SPLIT:
+            if not st.bt_pc.put(bt, inst.y) or not st.bt_sp.put(bt, sp) or not st.bt_log.put(bt, (i32)log):
+                return RUN_NO_MEMORY
+            bt += 1
+            pc = inst.x
+            continue
+        elif op == OP_MATCH:
+            return sp
+        # -- ECMAScript instructions ----------------------------------------------------------
+        elif op == OP_CHAR_I:
+            if sp < len:
+                let c = src.next(sp)
+                if canon(re, c) == inst.ch:
+                    sp += src.width(c)
+                    pc += 1
+                    continue
+        elif op == OP_RANGE or op == OP_RANGE_I:
+            if sp < len:
+                let c = src.next(sp)
+                let key = canon(re, c) if op == OP_RANGE_I else c
+                if es_class_has(re, (usize)inst.x, key):
+                    sp += src.width(c)
+                    pc += 1
+                    continue
+        elif op == OP_DOT:
+            if sp < len:
+                let c = src.next(sp)
+                if not is_line_terminator(c):
+                    sp += src.width(c)
+                    pc += 1
+                    continue
+        elif op == OP_ANY_ALL:
+            if sp < len:
+                sp += src.width(src.next(sp))
+                pc += 1
+                continue
+        elif op == OP_PREV:
+            if sp > 0:
+                sp -= src.width(src.prev(sp))
+                pc += 1
+                continue
+        elif op == OP_SAVE_RESET:
+            var g = inst.x
+            while g <= inst.y:
+                if not log_set(re, st, log, 2 * g, -1) or not log_set(re, st, log + 1, 2 * g + 1, -1):
+                    return RUN_NO_MEMORY
+                log += 2
+                g += 1
+            pc += 1
+            continue
+        elif op == OP_SET_REG:
+            if not log_set(re, st, log, inst.x, inst.y):
+                return RUN_NO_MEMORY
+            log += 1
+            pc += 1
+            continue
+        elif op == OP_SET_POS:
+            if not log_set(re, st, log, inst.x, sp):
+                return RUN_NO_MEMORY
+            log += 1
+            pc += 1
+            continue
+        elif op == OP_CHECK_ADV:
+            if re.caps[(usize)inst.x] != sp:
+                pc += 1
+                continue
+        elif op == OP_LOOP:
+            let v = re.caps[(usize)inst.x] - 1
+            if not log_set(re, st, log, inst.x, v):
+                return RUN_NO_MEMORY
+            log += 1
+            pc = inst.y if v != 0 else pc + 1
+            continue
+        elif op == OP_LOOP_SPLIT:
+            let v = re.caps[(usize)inst.x] - 1
+            if not log_set(re, st, log, inst.x, v):
+                return RUN_NO_MEMORY
+            log += 1
+            let limit = (i32)inst.ch
+            if v > limit:
+                # still in the mandatory iterations
+                pc = inst.y
+                continue
+            # an optional iteration that matched nothing fails (the minimum-th may)
+            if not (inst.negate and re.caps[(usize)inst.x + 1] == sp and v != limit):
+                if v == 0:
+                    pc += 1
+                    continue
+                let alt = pc + 1 if inst.ahead else inst.y
+                if not st.bt_pc.put(bt, alt) or not st.bt_sp.put(bt, sp) or not st.bt_log.put(bt, (i32)log):
+                    return RUN_NO_MEMORY
+                bt += 1
+                pc = inst.y if inst.ahead else pc + 1
+                continue
+        elif op == OP_LOOK_START:
+            let marker = -2 - inst.x if inst.negate else -1
+            if not st.bt_pc.put(bt, marker) or not st.bt_sp.put(bt, sp) or not st.bt_log.put(bt, (i32)log):
+                return RUN_NO_MEMORY
+            bt += 1
+            pc += 1
+            continue
+        elif op == OP_LOOK_MATCH:
+            # drop the body's choice points and the marker; keep the captures it set
+            bt -= 1
+            while st.bt_pc.data[bt] >= 0:
+                bt -= 1
+            sp = st.bt_sp.data[bt]
+            pc += 1
+            continue
+        elif op == OP_NLOOK_MATCH:
+            # the body matched: undo it and fail
+            bt -= 1
+            while st.bt_pc.data[bt] >= 0:
+                bt -= 1
+            let ll = (usize)st.bt_log.data[bt]
+            while log > ll:
+                log -= 1
+                re.caps[(usize)st.log_slot.data[log]] = st.log_val.data[log]
+        elif op == OP_BACKREF_ES:
+            let ne = es_backref_end(re, src, inst, sp)
+            if ne >= 0:
+                sp = ne
+                pc += 1
+                continue
+        # Failure: resume at the newest choice point.
+        while true:
+            if bt == 0:
+                return RUN_FAIL
+            bt -= 1
+            pc = st.bt_pc.data[bt]
+            sp = st.bt_sp.data[bt]
+            let ll = (usize)st.bt_log.data[bt]
+            while log > ll:
+                log -= 1
+                re.caps[(usize)st.log_slot.data[log]] = st.log_val.data[log]
+            if pc >= 0:
+                break
+            if pc <= -2:
+                # a negative lookaround whose body failed: it succeeds
+                pc = -2 - pc
+                break
+            # the body of a positive lookaround failed: so does the lookaround
+    return RUN_FAIL

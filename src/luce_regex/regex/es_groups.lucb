@@ -1,0 +1,191 @@
+#==============================================================================================
+#
+#   es_groups - ECMAScript group names, capture counting and modifiers
+#
+#   DESCRIPTION:
+#       Port of libregexp.c lines 1630-1843: re_parse_group_name, re_parse_captures (the
+#       scan that counts captures and finds forward references by name), find_group_name,
+#       is_duplicate_group_name and re_parse_modifiers. The group names are kept as QuickJS
+#       lays them out, which is also what `group_names` answers: for each capture group
+#       after group 0, its UTF-8 name, a NUL and the alternative scope it was defined in
+#       (an unnamed group is two NULs).
+#
+#==============================================================================================
+
+# mark: Group names ============================================================================
+
+# Parse a group name at `*pp` (the first char after '<') into `buf` (NUL-terminated, length in
+# `*len`); on success advance `*pp` past the '>' and answer true.
+func parse_group_name(ps: const EsParse*, buf: u8[], len: usize*, pp: usize*) -> bool:
+    var p = *pp
+    var q: usize = 0
+    while true:
+        var c = (u32)ch_at(ps, p)
+        if c == (u32)'\\':
+            p += 1
+            if ch_at(ps, p) != 'u':
+                return false
+            c = (u32)parse_escape(ps.src, &p, 2) # accept surrogate pairs
+        elif c == (u32)'>':
+            break
+        elif c >= 128:
+            var p1 = p
+            let d = unicode_from_utf8(ps, &p1)
+            if d < 0:
+                return false
+            p = p1
+            c = (u32)d
+            if is_hi_surrogate(c):
+                var p2 = p
+                let e = unicode_from_utf8(ps, &p2)
+                if e >= 0 and is_lo_surrogate((u32)e):
+                    c = from_surrogate(c, (u32)e)
+                    p = p2
+        else:
+            p += 1
+        if c > 0x10FFFF:
+            return false
+        if q == 0:
+            if not unicode.lre_js_is_ident_first(c):
+                return false
+        else:
+            if not unicode.lre_js_is_ident_next(c):
+                return false
+        if q + 6 + 1 > buf.length:
+            return false
+        q += utf8_encode(buf[q..], c)
+    if q == 0:
+        return false
+    buf[q] = 0
+    *len = q
+    p += 1
+    *pp = p
+    return true
+
+func same_name(a: const u8[], b: const u8[]) -> bool:
+    if a.length != b.length:
+        return false
+    var i: usize = 0
+    while i < a.length:
+        if a[i] != b[i]:
+            return false
+        i += 1
+    return true
+
+# re_parse_captures. With no `name`: the number of captures + 1. Otherwise the number of
+# capture groups called `name`, whose indexes are appended to `list` when it is given.
+# Sets `*has_named` to 1 when the pattern has a named group.
+func parse_captures(ps: const EsParse*, has_named: i32*, name: const u8[]?, list: Vec[i32]*?) -> i32!:
+    var capture_index: i32 = 1
+    var n: i32 = 0
+    *has_named = 0
+    var buf: u8[128]
+    let end = ps.src.length
+    var p: usize = 0
+    while p < end:
+        let c = ps.src[p]
+        if c == '(':
+            if ch_at(ps, p + 1) == '?':
+                if ch_at(ps, p + 2) == '<' and ch_at(ps, p + 3) != '=' and ch_at(ps, p + 3) != '!':
+                    *has_named = 1
+                    # potential named capture
+                    if let wanted = name:
+                        p += 3
+                        var len: usize = 0
+                        if parse_group_name(ps, buf, &len, &p):
+                            if same_name(buf[0..<len], wanted):
+                                if let l = list:
+                                    discard(try l.push(capture_index))
+                                n += 1
+                    capture_index += 1
+                    if capture_index >= CAPTURE_COUNT_MAX:
+                        break
+            else:
+                capture_index += 1
+                if capture_index >= CAPTURE_COUNT_MAX:
+                    break
+        elif c == '\\':
+            p += 1
+        elif c == '[':
+            # (C writes `p += 1 + (*p == ']')` with p still at the '[', so an initial ']'
+            # is not skipped; kept as it is)
+            p += 1
+            while p < end and ps.src[p] != ']':
+                if ps.src[p] == '\\':
+                    p += 1
+                p += 1
+        p += 1
+    if name != none:
+        return n
+    return capture_index
+
+func count_captures(ps: EsParse*) -> i32!:
+    if ps.total_capture_count < 0:
+        ps.total_capture_count = try parse_captures(ps, &ps.has_named_captures, none, none)
+    return ps.total_capture_count
+
+func has_named_captures(ps: EsParse*) -> bool!:
+    if ps.has_named_captures < 0:
+        discard(try count_captures(ps))
+    return ps.has_named_captures != 0
+
+# The groups already defined with the name `name`, appended to `list` when given; the count.
+func find_group_name(ps: const EsParse*, name: const u8[], list: Vec[i32]*?) -> i32!:
+    let names = ps.re.group_names.data[..<ps.re.group_names.used]
+    var p: usize = 0
+    var capture_index: i32 = 1
+    var n: i32 = 0
+    while p < names.length:
+        var len: usize = 0
+        while names[p + len] != 0:
+            len += 1
+        if same_name(names[p..<p + len], name):
+            if let l = list:
+                discard(try l.push(capture_index))
+            n += 1
+        p += len + 2
+        capture_index += 1
+    return n
+
+func is_duplicate_group_name(ps: const EsParse*, name: const u8[], scope: u8) -> bool:
+    let names = ps.re.group_names.data[..<ps.re.group_names.used]
+    var p: usize = 0
+    while p < names.length:
+        var len: usize = 0
+        while names[p + len] != 0:
+            len += 1
+        if same_name(names[p..<p + len], name) and names[p + len + 1] == scope:
+            return true
+        p += len + 2
+    return false
+
+# mark: Modifiers ==============================================================================
+
+# The i, m and s letters at `ps.p` as flag bits; a letter given twice is an error.
+func parse_modifiers(ps: EsParse*) -> i32!:
+    var mask: i32 = 0
+    while true:
+        let c = cur(ps)
+        var val: i32 = 0
+        if c == 'i':
+            val = es_ignore_case
+        elif c == 'm':
+            val = es_multiline
+        elif c == 's':
+            val = es_dotall
+        else:
+            break
+        if (mask & val) != 0:
+            var one: u8[1]
+            return try es_fail(ps, f"duplicate modifier: '{char_text(one, c)}'")
+        mask |= val
+        ps.p += 1
+    return mask
+
+func update_modifier(val: bool, add_mask: i32, remove_mask: i32, mask: i32) -> bool:
+    var v = val
+    if (add_mask & mask) != 0:
+        v = true
+    if (remove_mask & mask) != 0:
+        v = false
+    return v

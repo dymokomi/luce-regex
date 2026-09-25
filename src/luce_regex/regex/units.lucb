@@ -1,0 +1,94 @@
+#==============================================================================================
+#
+#   units - The subjects the VM matches over
+#
+#   DESCRIPTION:
+#       The VM reads its subject through `Units`, a statically dispatched interface: it is
+#       compiled once per subject type, so each reads its buffer directly. A position is an
+#       index into the buffer (a code point index for `CodePoints`, a code unit index for
+#       the others). `next(pos)` is the code point that starts at `pos`, `prev(pos)` the one
+#       that ends there, and `width(c)` the number of units a code point read that way
+#       spans. Only `Utf16Pairs` (the u and v flags over a 16-bit buffer) joins a surrogate
+#       pair into one code point; a lone surrogate stays itself.
+#
+#==============================================================================================
+
+interface Units:
+    func count() -> i32
+    func next(pos: i32) -> u32
+    func width(c: u32) -> i32
+    func prev(pos: i32) -> u32
+
+# The Oniguruma subject: Unicode code points.
+struct CodePoints: Units:
+    let data: const u32[]
+
+    inline func count() -> i32:
+        return (i32)self.data.length
+
+    inline func next(pos: i32) -> u32:
+        return self.data[(usize)pos]
+
+    inline func width(c: u32) -> i32:
+        return 1
+
+    inline func prev(pos: i32) -> u32:
+        return self.data[(usize)(pos - 1)]
+
+# An 8-bit ECMAScript subject: Latin-1 code units.
+struct Latin1: Units:
+    let data: const u8[]
+
+    inline func count() -> i32:
+        return (i32)self.data.length
+
+    inline func next(pos: i32) -> u32:
+        return (u32)self.data[(usize)pos]
+
+    inline func width(c: u32) -> i32:
+        return 1
+
+    inline func prev(pos: i32) -> u32:
+        return (u32)self.data[(usize)(pos - 1)]
+
+# A 16-bit ECMAScript subject without the u or v flag: every code unit is a character.
+struct Utf16: Units:
+    let data: const u16[]
+
+    inline func count() -> i32:
+        return (i32)self.data.length
+
+    inline func next(pos: i32) -> u32:
+        return (u32)self.data[(usize)pos]
+
+    inline func width(c: u32) -> i32:
+        return 1
+
+    inline func prev(pos: i32) -> u32:
+        return (u32)self.data[(usize)(pos - 1)]
+
+# A 16-bit ECMAScript subject with the u or v flag: a surrogate pair is one code point.
+struct Utf16Pairs: Units:
+    let data: const u16[]
+
+    inline func count() -> i32:
+        return (i32)self.data.length
+
+    func next(pos: i32) -> u32:
+        let c = (u32)self.data[(usize)pos]
+        if (c >> 10) == (0xD800 >> 10) and (usize)pos + 1 < self.data.length:
+            let d = (u32)self.data[(usize)pos + 1]
+            if (d >> 10) == (0xDC00 >> 10):
+                return 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00)
+        return c
+
+    inline func width(c: u32) -> i32:
+        return 2 if c > 0xFFFF else 1
+
+    func prev(pos: i32) -> u32:
+        let c = (u32)self.data[(usize)(pos - 1)]
+        if (c >> 10) == (0xDC00 >> 10) and pos > 1:
+            let h = (u32)self.data[(usize)(pos - 2)]
+            if (h >> 10) == (0xD800 >> 10):
+                return 0x10000 + ((h - 0xD800) << 10) + (c - 0xDC00)
+        return c

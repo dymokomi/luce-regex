@@ -1,0 +1,299 @@
+#==============================================================================================
+#
+#   es_escape - ECMAScript parse state, errors, UTF-8 and escape sequences
+#
+#   DESCRIPTION:
+#       The state of the ECMAScript front end (libregexp.c's REParseState) and the lexical
+#       helpers of libregexp.c lines 616-850: parse errors with QuickJS's messages,
+#       parse_digits, re_parse_expect and lre_parse_escape (public, as QuickJS's lexer
+#       uses it too). The pattern is bytes; like the C parser, which reads a NUL-terminated
+#       buffer, reading at or past the end yields 0.
+#
+#==============================================================================================
+
+# mark: Parse state ============================================================================
+
+let CAPTURE_COUNT_MAX: i32 = 255
+let REGISTER_COUNT_MAX: i32 = 255
+
+# The ECMAScript flags (QuickJS's LRE_FLAG_* values).
+## The `g` flag (only recorded).
+pub let es_global: i32 = 1 << 0
+## The `i` flag.
+pub let es_ignore_case: i32 = 1 << 1
+## The `m` flag.
+pub let es_multiline: i32 = 1 << 2
+## The `s` flag.
+pub let es_dotall: i32 = 1 << 3
+## The `u` flag.
+pub let es_unicode: i32 = 1 << 4
+## The `y` flag: match only at the start index.
+pub let es_sticky: i32 = 1 << 5
+## The `d` flag (only recorded).
+pub let es_indices: i32 = 1 << 6
+## Set by the compiler when the pattern has named groups.
+pub let es_named_groups: i32 = 1 << 7
+## The `v` flag.
+pub let es_unicode_sets: i32 = 1 << 8
+
+struct EsParse:
+    var re: Regex*
+    var src: const u8[]
+    var p: usize
+    var is_unicode: bool
+    var unicode_sets: bool # if set, is_unicode is also set
+    var ignore_case: bool
+    var multi_line: bool
+    var dotall: bool
+    var group_name_scope: u8
+    var capture_count: i32
+    var total_capture_count: i32 # -1 = not computed yet
+    var has_named_captures: i32 # -1 = don't know, 0 = no, 1 = yes
+    var check_stack: (func(void*?, usize) -> bool)?
+    var opaque: void*?
+    var message: u8[128]
+    var message_len: usize
+    # a group name being parsed (C's tmp_buf), NUL-terminated
+    var name: u8[128]
+    var name_len: usize
+
+# The byte at `i`, or 0 at or past the end (the C buffer's NUL terminator).
+func byte_at(text: const u8[], i: usize) -> u8:
+    if i < text.length:
+        return text[i]
+    return 0
+
+func ch_at(ps: const EsParse*, i: usize) -> u8:
+    return byte_at(ps.src, i)
+
+func cur(ps: const EsParse*) -> u8:
+    return ch_at(ps, ps.p)
+
+func is_ascii_digit(c: u8) -> bool:
+    return c >= '0' and c <= '9'
+
+func from_hex(c: u8) -> i32:
+    if c >= '0' and c <= '9':
+        return (i32)(c - '0')
+    if c >= 'A' and c <= 'F':
+        return (i32)(c - 'A') + 10
+    if c >= 'a' and c <= 'f':
+        return (i32)(c - 'a') + 10
+    return -1
+
+func is_hi_surrogate(c: u32) -> bool:
+    return (c >> 10) == (0xD800 >> 10)
+
+func is_lo_surrogate(c: u32) -> bool:
+    return (c >> 10) == (0xDC00 >> 10)
+
+func from_surrogate(hi: u32, lo: u32) -> u32:
+    return 0x10000 + 0x400 * (hi - 0xD800) + (lo - 0xDC00)
+
+# mark: Errors =================================================================================
+
+# Record the message (truncated to 127 bytes, as C's vsnprintf into its buffer) and fail
+# with `syntax_error`; compile_ecmascript reports the message.
+func es_fail(ps: EsParse*, text: fmt) -> i32!:
+    var buf: u8[128]
+    let msg = format(buf, text) catch failure:
+        recover (str)buf[0..<127]
+    var n = msg.length
+    if n > 127:
+        n = 127
+    var i: usize = 0
+    while i < n:
+        ps.message[i] = msg.bytes[i]
+        i += 1
+    ps.message[n] = 0
+    ps.message_len = n
+    error(syntax_error, "regular expression syntax error")
+
+# The one-byte text of `c`, for the "%c" messages.
+func char_text(buf: u8[], c: u8) -> str:
+    buf[0] = c
+    return (str)buf[0..<1]
+
+func es_expect(ps: EsParse*, c: u8) -> !:
+    if cur(ps) != c:
+        var one: u8[1]
+        discard(try es_fail(ps, f"expecting '{char_text(one, c)}'"))
+    ps.p += 1
+
+# If allow_overflow is false, return -1 in case of
+# overflow. Otherwise return INT32_MAX.
+func parse_digits(ps: const EsParse*, pp: usize*, allow_overflow: bool) -> i32:
+    var p = *pp
+    var v: u64 = 0
+    while true:
+        let c = ch_at(ps, p)
+        if c < '0' or c > '9':
+            break
+        v = v * 10 + (u64)(c - '0')
+        if v >= (u64)INT32_MAX:
+            if allow_overflow:
+                v = (u64)INT32_MAX
+            else:
+                return -1
+        p += 1
+    *pp = p
+    return (i32)v
+
+# mark: UTF-8 ==================================================================================
+
+let utf8_min_code: u32[5] = [0x80, 0x800, 0x10000, 0x00200000, 0x04000000]
+let utf8_first_code_mask: u8[5] = [0x1f, 0xf, 0x7, 0x3, 0x1]
+
+# cutils.c unicode_from_utf8 over the pattern: the code point at `*pp` (advanced past it),
+# or -1 (and `*pp` unchanged) for a malformed sequence. Surrogates encoded in three bytes
+# are accepted, which is how a lone surrogate reaches the parser.
+func unicode_from_utf8(ps: const EsParse*, pp: usize*) -> i32:
+    var p = *pp
+    var c = (u32)ch_at(ps, p)
+    p += 1
+    if c < 0x80:
+        *pp = p
+        return (i32)c
+    var l: usize = 0
+    if c >= 0xc0 and c <= 0xdf:
+        l = 1
+    elif c >= 0xe0 and c <= 0xef:
+        l = 2
+    elif c >= 0xf0 and c <= 0xf7:
+        l = 3
+    elif c >= 0xf8 and c <= 0xfb:
+        l = 4
+    elif c == 0xfc or c == 0xfd:
+        l = 5
+    else:
+        return -1
+    # check that we have enough characters (max_len is UTF8_CHAR_LEN_MAX = 6)
+    c &= (u32)utf8_first_code_mask[l - 1]
+    var i: usize = 0
+    while i < l:
+        let b = (u32)ch_at(ps, p)
+        p += 1
+        if b < 0x80 or b >= 0xc0:
+            return -1
+        c = (c << 6) | (b & 0x3f)
+        i += 1
+    if c < utf8_min_code[l - 1]:
+        return -1
+    *pp = p
+    return (i32)c
+
+# The UTF-8 bytes of `c` into `out` (at most 4 for code points up to 0x10FFFF); the count.
+func utf8_encode(out: u8[], c: u32) -> usize:
+    if c < 0x80:
+        out[0] = (u8)c
+        return 1
+    if c < 0x800:
+        out[0] = (u8)(0xc0 | (c >> 6))
+        out[1] = (u8)(0x80 | (c & 0x3f))
+        return 2
+    if c < 0x10000:
+        out[0] = (u8)(0xe0 | (c >> 12))
+        out[1] = (u8)(0x80 | ((c >> 6) & 0x3f))
+        out[2] = (u8)(0x80 | (c & 0x3f))
+        return 3
+    out[0] = (u8)(0xf0 | (c >> 18))
+    out[1] = (u8)(0x80 | ((c >> 12) & 0x3f))
+    out[2] = (u8)(0x80 | ((c >> 6) & 0x3f))
+    out[3] = (u8)(0x80 | (c & 0x3f))
+    return 4
+
+# mark: Escapes ================================================================================
+
+## Parse the escape sequence of `text` at `*pos` (just after a backslash), as QuickJS's
+## lre_parse_escape: answer its code point and advance `*pos`, or answer -1 if it is
+## malformed, or -2 if it is not a character escape (`*pos` is then unchanged). Reading at
+## or past the end of `text` yields 0, as C reads the terminating NUL. `allow_utf16` is 0
+## (no `\u{...}`), 1 (`\u{...}` allowed) or 2 (also joins an escaped surrogate pair into one
+## code point and refuses legacy octal: the unicode regexp case).
+pub func parse_escape(text: const u8[], pos: usize*, allow_utf16: i32) -> i32:
+    var p = *pos
+    let b = byte_at(text, p)
+    p += 1
+    var c: u32 = b
+    match b:
+        'b':
+            c = 0x08
+        'f':
+            c = 0x0c
+        'n':
+            c = 0x0a
+        'r':
+            c = 0x0d
+        't':
+            c = 0x09
+        'v':
+            c = 0x0b
+        'x':
+            let h0 = from_hex(byte_at(text, p))
+            p += 1
+            if h0 < 0:
+                return -1
+            let h1 = from_hex(byte_at(text, p))
+            p += 1
+            if h1 < 0:
+                return -1
+            c = (u32)((h0 << 4) | h1)
+        'u':
+            if byte_at(text, p) == '{' and allow_utf16 != 0:
+                p += 1
+                c = 0
+                while true:
+                    let h = from_hex(byte_at(text, p))
+                    p += 1
+                    if h < 0:
+                        return -1
+                    c = (c << 4) | (u32)h
+                    if c > 0x10FFFF:
+                        return -1
+                    if byte_at(text, p) == '}':
+                        break
+                p += 1
+            else:
+                c = 0
+                var i: i32 = 0
+                while i < 4:
+                    let h = from_hex(byte_at(text, p))
+                    p += 1
+                    if h < 0:
+                        return -1
+                    c = (c << 4) | (u32)h
+                    i += 1
+                if is_hi_surrogate(c) and allow_utf16 == 2 and byte_at(text, p) == '\\' and byte_at(text, p + 1) == 'u':
+                    # convert an escaped surrogate pair into a unicode char
+                    var c1: u32 = 0
+                    var k: usize = 0
+                    while k < 4:
+                        let h = from_hex(byte_at(text, p + 2 + k))
+                        if h < 0:
+                            break
+                        c1 = (c1 << 4) | (u32)h
+                        k += 1
+                    if k == 4 and is_lo_surrogate(c1):
+                        p += 6
+                        c = from_surrogate(c, c1)
+        '0'..='7':
+            c -= (u32)'0'
+            if allow_utf16 == 2:
+                # only accept \0 not followed by digit
+                if c != 0 or is_ascii_digit(byte_at(text, p)):
+                    return -1
+            else:
+                # parse a legacy octal sequence
+                var v = (u32)byte_at(text, p) -% (u32)'0'
+                if v <= 7:
+                    c = (c << 3) | v
+                    p += 1
+                    if c < 32:
+                        v = (u32)byte_at(text, p) -% (u32)'0'
+                        if v <= 7:
+                            c = (c << 3) | v
+                            p += 1
+        _:
+            return -2
+    *pos = p
+    return (i32)c

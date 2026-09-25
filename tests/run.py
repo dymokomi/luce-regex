@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--base", type=Path, default=ROOT.parent / ("luce-base/build/luce-base.exe" if os.name == "nt" else "luce-base/build/luce-base"))
 args = parser.parse_args()
-modules = [ROOT / "src/luce_regex/unicode", ROOT / "src/luce_regex/regex.lucb"]
+modules = [ROOT / "src/luce_regex/unicode", ROOT / "src/luce_regex/regex"]
 for module in modules:
     for flags in [["--native"], ["--backend=c"]]:
         subprocess.run([str(args.base.resolve()), "test", str(module), *flags],

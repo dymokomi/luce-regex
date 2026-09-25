@@ -1,0 +1,102 @@
+#==============================================================================================
+#
+#   es_match - ECMAScript character tests, anchors and backreferences
+#
+#   DESCRIPTION:
+#       What the VM's ECMAScript instructions ask of the subject, as libregexp.c's
+#       lre_exec_backtrack answers it: Canonicalize (lre_canonicalize: simple case folding
+#       with the u or v flag, toUpperCase otherwise), class membership by binary search over
+#       sorted ranges, the line terminators of `.`, `^` and `$`, the word characters of `\b`
+#       (ASCII, plus U+017F and U+212A under the i and u flags), and backreferences, forward
+#       or backward, to the first group of a (possibly duplicated) name that is set.
+#
+#==============================================================================================
+
+# The Canonicalize of the regexp's mode.
+func canon(re: const Regex*, c: u32) -> u32:
+    return (u32)unicode.lre_canonicalize(c, re.unicode)
+
+func is_line_terminator(c: u32) -> bool:
+    return c == 0x0A or c == 0x0D or c == 0x2028 or c == 0x2029
+
+# Whether class `ci` (sorted, disjoint, inclusive ranges) contains `c`.
+func es_class_has(re: const Regex*, ci: usize, c: u32) -> bool:
+    let cls = re.classes.data[ci]
+    let base = cls.range_start
+    var lo: usize = 0
+    var hi: usize = cls.range_count
+    while lo < hi:
+        let mid = (lo + hi) // 2
+        if c < re.ranges.data[base + 2 * mid]:
+            hi = mid
+        elif c > re.ranges.data[base + 2 * mid + 1]:
+            lo = mid + 1
+        else:
+            return true
+    return false
+
+func es_is_word(c: u32, ignore_case: bool) -> bool:
+    if c < 256:
+        return unicode.lre_is_word_byte((u8)c)
+    return ignore_case and (c == 0x017f or c == 0x212a)
+
+func es_anchor_ok[S: Units](re: const Regex*, src: const S*, kind: u8, pos: i32) -> bool:
+    if kind == AN_ES_BOL:
+        return pos == 0
+    if kind == AN_ES_BOL_M:
+        return pos == 0 or is_line_terminator(src.prev(pos))
+    if kind == AN_ES_EOL:
+        return pos == re.len
+    if kind == AN_ES_EOL_M:
+        return pos == re.len or is_line_terminator(src.next(pos))
+    let ignore_case = kind == AN_ES_WB_I or kind == AN_ES_NWB_I
+    let v1 = pos > 0 and es_is_word(src.prev(pos), ignore_case)
+    let v2 = pos < re.len and es_is_word(src.next(pos), ignore_case)
+    if kind == AN_ES_WB or kind == AN_ES_WB_I:
+        return v1 != v2
+    return v1 == v2
+
+# A backreference: the first group of the list whose capture is set is compared with the
+# subject at `sp`, forward or (in a lookbehind) backward; a group that is not set matches
+# the empty string. The new position, or -1.
+func es_backref_end[S: Units](re: const Regex*, src: const S*, inst: Inst, sp0: i32) -> i32:
+    let ignore_case = (inst.ch & 1) != 0
+    let backward = (inst.ch & 2) != 0
+    var sp = sp0
+    var i: i32 = 0
+    while i < inst.y:
+        let g = re.ref_lists.data[(usize)(inst.x + i)]
+        let cs = re.caps[(usize)(2 * g)]
+        let ce = re.caps[(usize)(2 * g + 1)]
+        if cs >= 0 and ce >= 0:
+            if not backward:
+                var p = cs
+                while p < ce:
+                    if sp >= re.len:
+                        return -1
+                    var c1 = src.next(p)
+                    p += src.width(c1)
+                    var c2 = src.next(sp)
+                    sp += src.width(c2)
+                    if ignore_case:
+                        c1 = canon(re, c1)
+                        c2 = canon(re, c2)
+                    if c1 != c2:
+                        return -1
+            else:
+                var p = ce
+                while p > cs:
+                    if sp <= 0:
+                        return -1
+                    var c1 = src.prev(p)
+                    p -= src.width(c1)
+                    var c2 = src.prev(sp)
+                    sp -= src.width(c2)
+                    if ignore_case:
+                        c1 = canon(re, c1)
+                        c2 = canon(re, c2)
+                    if c1 != c2:
+                        return -1
+            return sp
+        i += 1
+    return sp

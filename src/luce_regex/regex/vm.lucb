@@ -1,0 +1,125 @@
+#==============================================================================================
+#
+#   vm - The backtracking VM of the Oniguruma dialect
+#
+#   DESCRIPTION:
+#       `run_prog` executes a flat instruction array from one start position by iterative
+#       backtracking: a stack of choice points (pc, position, save-log length) and a save log
+#       of overwritten capture and register slots, unwound on backtrack. Nothing recurses
+#       except an Oniguruma lookaround, which runs its subprogram on fresh stacks.
+#
+#       Every step counts against `budget`; the match stops (no match) when it runs out.
+#
+#       The ECMAScript dialect has its own loop over the same instructions and stacks
+#       (es_vm.lucb). Keeping the two apart keeps each loop small: the native backend keeps
+#       more of a small loop's state in registers, and the TextMate path measured about a
+#       third slower when one loop held both instruction sets.
+#
+#==============================================================================================
+
+# mark: Results ================================================================================
+
+# run_prog's results besides a (>= 0) end position.
+let RUN_FAIL: i32 = -1
+let RUN_INTERRUPTED: i32 = -2
+let RUN_NO_MEMORY: i32 = -3
+
+# Record the old value of `slot` in the save log at `log` and store `value`; false when the
+# log cannot grow.
+func log_set(re: Regex*, st: Stacks*, log: usize, slot: i32, value: i32) -> bool:
+    if not st.log_slot.put(log, slot) or not st.log_val.put(log, re.caps[(usize)slot]):
+        return false
+    re.caps[(usize)slot] = value
+    return true
+
+# mark: The loop ===============================================================================
+
+## Run `code` from `sp0`. Returns the end position on success (== `want_end` when that is not
+## -1, for an Oniguruma lookbehind that must end exactly there), or a RUN_* code.
+func run_prog[S: Units](re: Regex*, src: const S*, code: const Inst[], sp0: i32, want_end: i32,
+                        st: Stacks*) -> i32:
+    var bt: usize = 0
+    var log: usize = 0
+    var pc: i32 = 0
+    var sp: i32 = sp0
+    let len = re.len
+    while true:
+        re.steps += 1
+        if re.steps > re.budget:
+            return RUN_FAIL
+        let inst = code[(usize)pc]
+        let op = inst.op
+        if op == OP_CHAR:
+            if sp < len:
+                let c = src.next(sp)
+                if c == inst.ch or (re.ic and swapcase(c) == inst.ch):
+                    sp += src.width(c)
+                    pc += 1
+                    continue
+        elif op == OP_ANY:
+            if sp < len:
+                let c = src.next(sp)
+                if re.dotall or c != (u32)'\n':
+                    sp += src.width(c)
+                    pc += 1
+                    continue
+        elif op == OP_CLASS:
+            if sp < len:
+                let c = src.next(sp)
+                if class_ok(re, (usize)inst.x, c):
+                    sp += src.width(c)
+                    pc += 1
+                    continue
+        elif op == OP_ASSERT:
+            if anchor_ok(re, src, (u8)inst.x, sp):
+                pc += 1
+                continue
+        elif op == OP_SAVE:
+            if not log_set(re, st, log, inst.x, sp):
+                return RUN_NO_MEMORY
+            log += 1
+            pc += 1
+            continue
+        elif op == OP_JMP:
+            pc = inst.x
+            continue
+        elif op == OP_SPLIT:
+            if not st.bt_pc.put(bt, inst.y) or not st.bt_sp.put(bt, sp) or not st.bt_log.put(bt, (i32)log):
+                return RUN_NO_MEMORY
+            bt += 1
+            pc = inst.x
+            continue
+        elif op == OP_MARK:
+            re.marks[(usize)inst.x] = sp
+            pc += 1
+            continue
+        elif op == OP_PROGRESS:
+            if sp != re.marks[(usize)inst.x]:
+                pc += 1
+                continue
+        elif op == OP_BACKREF:
+            let ne = backref_end(re, src, inst.x, sp)
+            if ne >= 0:
+                sp = ne
+                pc += 1
+                continue
+        elif op == OP_LOOK:
+            if onig_run_look(re, src, inst, sp):
+                pc += 1
+                continue
+        elif op == OP_MATCH:
+            if want_end < 0 or sp == want_end:
+                return sp
+        # Failure: resume at the newest choice point.
+        while true:
+            if bt == 0:
+                return RUN_FAIL
+            bt -= 1
+            pc = st.bt_pc.data[bt]
+            sp = st.bt_sp.data[bt]
+            let ll = (usize)st.bt_log.data[bt]
+            while log > ll:
+                log -= 1
+                re.caps[(usize)st.log_slot.data[log]] = st.log_val.data[log]
+            break
+    return RUN_FAIL

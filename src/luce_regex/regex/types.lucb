@@ -1,0 +1,327 @@
+#==============================================================================================
+#
+#   types - The compiled program, its AST nodes, and the public `Regex` type
+#
+#   DESCRIPTION:
+#       `Regex` holds everything a compiled pattern owns: the AST while it is being
+#       compiled, the instructions, the character classes, the group names and the match
+#       state (captures, registers and the backtracking stacks, reused between matches).
+#       Its methods are the Oniguruma dialect's API and the accessors both dialects share;
+#       the work is done by the free functions of the other fragments.
+#
+#==============================================================================================
+
+# mark: Structures =============================================================================
+
+## One compiled instruction. Fields are reused across opcodes.
+struct Inst:
+    var op: u8 = 0
+    var x: i32 = 0
+    var y: i32 = 0
+    var ch: u32 = 0
+    var ahead: bool = true
+    var negate: bool = false
+
+## One AST node. `a` holds a group index, anchor kind, backref index, repeat minimum, or a class
+## index; `b` a repeat maximum (-1 = unbounded; INT32_MAX in the ECMAScript dialect).
+## Children are an index-linked list. ECMAScript nodes also carry `flags` (F_IC, F_DOTALL,
+## F_MULTI), and `x`/`y`: a repeat's captures [x, y), or a backreference's group list.
+struct Node:
+    var kind: u8 = 0
+    var ch: u32 = 0
+    var a: i32 = 0
+    var b: i32 = 0
+    var greedy: bool = true
+    var ahead: bool = true
+    var negate: bool = false
+    var flags: u8 = 0
+    var x: i32 = 0
+    var y: i32 = 0
+    var first_child: i32 = -1
+    var next_sibling: i32 = -1
+
+## A compiled character class: builtin bits plus a run of inclusive (lo, hi) codepoint ranges in
+## the pool. ECMAScript classes use no builtins and keep their ranges sorted and disjoint.
+struct CharClass:
+    var negate: bool = false
+    var builtins: u32 = 0
+    var range_start: usize = 0
+    var range_count: usize = 0
+
+## A lookaround subprogram (Oniguruma): its own flat instruction array ending in MATCH.
+struct Program:
+    var code: Inst[]
+    var length: usize = 0
+
+## A named capturing group.
+struct NameEntry:
+    var start: i32 = 0
+    var len: i32 = 0
+    var group: i32 = 0
+
+## A slice into the codepoint name pool.
+struct Span:
+    var start: i32 = 0
+    var len: i32 = 0
+
+## The backtracking stacks: choice points (pc, position, save-log length) and the save log of
+## overwritten capture and register slots, unwound on backtrack. A choice point whose pc is
+## negative is a lookaround marker: -1 for a positive one, -2 - continuation for a negative.
+struct Stacks:
+    var bt_pc: Vec[i32]
+    var bt_sp: Vec[i32]
+    var bt_log: Vec[i32]
+    var log_slot: Vec[i32]
+    var log_val: Vec[i32]
+
+    mutating func free_all():
+        self.bt_pc.free_all()
+        self.bt_sp.free_all()
+        self.bt_log.free_all()
+        self.log_slot.free_all()
+        self.log_val.free_all()
+
+func stacks_on(heap: Heap) -> Stacks:
+    return Stacks(bt_pc = Vec[i32](heap = heap), bt_sp = Vec[i32](heap = heap),
+                  bt_log = Vec[i32](heap = heap), log_slot = Vec[i32](heap = heap),
+                  log_val = Vec[i32](heap = heap))
+
+# mark: The engine =============================================================================
+
+## A compiled pattern with its last-match state. Compile once, then call `search`/`match_at`
+## (native, over a codepoint subject) or `find` (over a `str`); read the result with the
+## accessors. Distinct patterns use distinct `Regex` values, so their last-match state is
+## independent. An ECMAScript program comes from `compile_ecmascript` instead and is matched
+## with `exec8`/`exec16` (es_api.lucb).
+pub struct Regex:
+    # Parse/compile scratch (freed after `build`).
+    var pat: Vec[u32]
+    var pp: usize = 0
+    var nodes: Vec[Node]
+    # Flags.
+    var ic: bool = false
+    var ext: bool = false
+    var dotall: bool = false
+    var multi: bool = false
+    # Groups and names.
+    var ngroups: i32 = 0
+    var name_cps: Vec[u32]
+    var names: Vec[NameEntry]
+    # Classes.
+    var classes: Vec[CharClass]
+    var ranges: Vec[u32]
+    # Compiled program.
+    var code: Vec[Inst]
+    var subprogs: Vec[Program]
+    var mark_count: i32 = 0
+    var marks: i32[]
+    var caps: i32[]
+    var has_g: bool = false
+    # First-character filter.
+    var first_any: bool = false
+    var first_chars: Vec[u32]
+    var first_classes: Vec[i32]
+    # Match state.
+    var len: i32 = 0
+    var anchor: i32 = 0
+    var steps: i32 = 0
+    var budget: i32 = 200000
+    # Reusable stacks for the main run (an Oniguruma lookaround uses fresh local stacks).
+    var stacks: Stacks
+    # Buffer for the `str` convenience path.
+    var text_subj: Vec[u32]
+    # The ECMAScript dialect (es_api.lucb): the flags, the capture count including group 0,
+    # the register count, the group names in QuickJS's layout, the backreference group
+    # lists, the allocation hook and, during an exec, the interrupt callback.
+    var es: bool = false
+    var es_flags: i32 = 0
+    var unicode: bool = false
+    var ncap: i32 = 1
+    var nregs: i32 = 0
+    var reg_depth: i32 = 0
+    var group_names: Vec[u8]
+    var ref_lists: Vec[i32]
+    var heap: Heap
+    var check_timeout: (func(void*?) -> bool)? = none
+    var host_opaque: void*? = none
+    var first_chars_i: Vec[u32]
+
+    ## Compile `pattern`. `ignore_case` starts the whole pattern case-insensitive; an inline
+    ## `(?i)` has the same effect. A malformed pattern fails with `syntax_error`.
+    pub func init(pattern: str, ignore_case: bool = false) -> !:
+        self.pat = Vec[u32]()
+        self.pp = 0
+        self.nodes = Vec[Node]()
+        self.ic = false
+        self.ext = false
+        self.dotall = false
+        self.multi = false
+        self.ngroups = 0
+        self.name_cps = Vec[u32]()
+        self.names = Vec[NameEntry]()
+        self.classes = Vec[CharClass]()
+        self.ranges = Vec[u32]()
+        self.code = Vec[Inst]()
+        self.subprogs = Vec[Program]()
+        self.mark_count = 0
+        var empty: i32[]
+        self.marks = empty
+        self.caps = empty
+        self.has_g = false
+        self.first_any = false
+        self.first_chars = Vec[u32]()
+        self.first_classes = Vec[i32]()
+        self.len = 0
+        self.anchor = 0
+        self.steps = 0
+        self.budget = 200000
+        self.stacks = stacks_on(Heap())
+        self.text_subj = Vec[u32]()
+        self.es = false
+        self.es_flags = 0
+        self.unicode = false
+        self.ncap = 1
+        self.nregs = 0
+        self.reg_depth = 0
+        self.group_names = Vec[u8]()
+        self.ref_lists = Vec[i32]()
+        self.heap = Heap()
+        self.check_timeout = none
+        self.host_opaque = none
+        self.first_chars_i = Vec[u32]()
+        onig_build(&self, pattern, ignore_case) catch failure:
+            regex_dispose(&self)
+            error(failure.code, failure.message)
+
+    ## Whether the pattern uses `\G`, whose match depends on the anchor. A caller caching a
+    ## pattern's match across positions must re-run such a pattern rather than reuse the result.
+    pub func uses_g() -> bool:
+        return self.has_g
+
+    ## The leftmost match at or after `offset` over `subject` (a codepoint array), or false.
+    ## `anchor` is the position `\G` asserts. Sets the last-match state on success.
+    pub mutating func search(subject: const u32[], offset: i32, anchor: i32) -> bool:
+        return onig_search(&self, subject, offset, anchor)
+
+    ## A match anchored exactly at `pos` (no scanning), or false.
+    pub mutating func match_at(subject: const u32[], pos: i32, anchor: i32) -> bool:
+        return onig_match_at(&self, subject, pos, anchor)
+
+    ## The leftmost match at or after codepoint `offset` in `text`, or false. Convenience for
+    ## `str` callers; decodes into a reused buffer.
+    pub mutating func find(text: str, offset: i32, anchor: i32) -> bool:
+        self.text_subj.used = 0
+        decode_subj(text, &self.text_subj) catch failure:
+            return false
+        return onig_search(&self, self.text_subj.data[..<self.text_subj.used], offset, anchor)
+
+    # -- match accessors -----------------------------------------------------------------------
+
+    ## The whole-match start offset (a codepoint index).
+    pub func match_start() -> i32:
+        return self.caps[0]
+
+    ## The whole-match end offset (a codepoint index).
+    pub func match_end() -> i32:
+        return self.caps[1]
+
+    ## The number of groups, including group 0 (the whole match).
+    pub func group_count() -> i32:
+        return self.ncap
+
+    ## The start of capturing group `index`, or -1 when unset.
+    pub func group_start(index: i32) -> i32:
+        if index >= 0 and index < self.ncap:
+            return self.caps[(usize)(2 * index)]
+        return -1
+
+    ## The end of capturing group `index`, or -1 when unset.
+    pub func group_end(index: i32) -> i32:
+        if index >= 0 and index < self.ncap:
+            return self.caps[(usize)(2 * index + 1)]
+        return -1
+
+    ## The index of a named group, or -1 when the pattern has no such name. (For an
+    ## ECMAScript program with a duplicated name, the first group of that name.)
+    pub func group_of(name: str) -> i32:
+        if self.es:
+            return es_group_of(&self, name)
+        var query = Vec[u32]()
+        decode_subj(name, &query) catch failure:
+            query.free_all()
+            return -1
+        var result: i32 = -1
+        var i: usize = 0
+        while i < self.names.used and result < 0:
+            let entry = self.names.data[i]
+            if (usize)entry.len == query.used and pool_eq(&self, entry.start, query):
+                result = entry.group
+            i += 1
+        query.free_all()
+        return result
+
+    # -- teardown ------------------------------------------------------------------------------
+
+    ## Release every allocation the pattern holds. (An ECMAScript program is released with
+    ## `free_ecmascript`, which also frees the `Regex` itself.)
+    pub mutating func close():
+        regex_dispose(&self)
+
+    static func own(native: Regex*) -> interop.Reference[Regex]!:
+        return try interop.Reference[Regex].adopt(native, regex_type)
+
+## The interop type of a compiled `Regex`.
+pub let regex_type: interop.Type[Regex] = interop.Type[Regex]("regex", Regex.close, closeable = true)
+
+## Compile `pattern` into an owned reference. `ignore_case` starts it case-insensitive.
+pub func compile(pattern: str, ignore_case: bool = false) -> interop.Reference[Regex]!:
+    let native = try new Regex(pattern, ignore_case)
+    return try Regex.own(native)
+
+func pool_eq(re: const Regex*, start: i32, query: Vec[u32]) -> bool:
+    var i: usize = 0
+    while i < query.used:
+        if re.name_cps.data[(usize)start + i] != query.data[i]:
+            return false
+        i += 1
+    return true
+
+func regex_dispose(re: Regex*):
+    re.pat.free_all()
+    re.nodes.free_all()
+    re.name_cps.free_all()
+    re.names.free_all()
+    re.classes.free_all()
+    re.ranges.free_all()
+    re.code.free_all()
+    var i: usize = 0
+    while i < re.subprogs.used:
+        let prog = re.subprogs.data[i]
+        if prog.code.length > 0:
+            free(prog.code) in memory.heap
+        i += 1
+    re.subprogs.free_all()
+    re.first_chars.free_all()
+    re.first_classes.free_all()
+    re.first_chars_i.free_all()
+    re.stacks.free_all()
+    re.text_subj.free_all()
+    re.group_names.free_all()
+    re.ref_lists.free_all()
+    heap_free[i32](&re.heap, re.marks)
+    heap_free[i32](&re.heap, re.caps)
+    var empty: i32[]
+    re.marks = empty
+    re.caps = empty
+
+## Decode `text` into a codepoint array. Invalid bytes pass through as their own value.
+func decode_subj(text: str, out: Vec[u32]*) -> !:
+    let bytes = text.bytes
+    var offset: usize = 0
+    while offset < bytes.length:
+        if let decoded = utf8.decode(bytes, offset):
+            discard(try out.push((u32)decoded.scalar))
+            offset += decoded.width
+        else:
+            discard(try out.push((u32)bytes[offset]))
+            offset += 1

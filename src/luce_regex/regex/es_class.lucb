@@ -1,0 +1,406 @@
+#==============================================================================================
+#
+#   es_class - ECMAScript class atoms, Unicode properties and bracketed classes
+#
+#   DESCRIPTION:
+#       Port of libregexp.c lines 852-1552 (CONFIG_ALL_UNICODE is on): parse_unicode_property
+#       (\p{...} and \P{...}: General_Category, Script, Script_Extensions, binary properties
+#       and, with the v flag, sequence properties), parse_class_string_disjunction (\q{...}),
+#       get_class_atom (a character or a class escape, with the Annex B leniency of
+#       patterns without u or v) and re_parse_nested_class (ranges, nested classes and the v
+#       flag's && and -- operations).
+#
+#==============================================================================================
+
+# mark: Unicode properties =====================================================================
+
+# XXX: we use the same chars for name and value
+func is_unicode_char(c: u8) -> bool:
+    return ((c >= '0' and c <= '9') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= 'a' and c <= 'z') or
+            (c == '_'))
+
+# The collection of a sequence property's strings (C's seq_prop_cb).
+struct SeqCollect:
+    var set: StrSet*
+    var failed: bool
+
+func seq_prop_cb(opaque: void*?, seq: const u32[]):
+    let sc = (SeqCollect*)(opaque else trap("seq_prop_cb: no set"))
+    set_add(sc.set, seq) catch failure:
+        sc.failed = true
+
+# The lookup of `name=value` (or a lone `name`) into `s`: 0, or -2 for an unknown name
+# (-3 for an unknown script, -4 for an unknown general category), the set then freed.
+func property_lookup(ps: EsParse*, s: StrSet*, name: str, value: str, is_inv: bool,
+                     allow_sequence_prop: bool) -> i32!:
+    if name == "Script" or name == "sc" or name == "Script_Extensions" or name == "scx":
+        let script_ext = not (name == "Script" or name == "sc")
+        set_init(ps, s)
+        let ret = unicode.unicode_script(&s.cr, value, script_ext)
+        if ret != 0:
+            set_free(s)
+            if ret == -2:
+                return -3
+            error(memory.exhausted, "regex: out of memory")
+    elif name == "General_Category" or name == "gc":
+        set_init(ps, s)
+        let ret = unicode.unicode_general_category(&s.cr, value)
+        if ret != 0:
+            set_free(s)
+            if ret == -2:
+                return -4
+            error(memory.exhausted, "regex: out of memory")
+    elif value.length == 0:
+        set_init(ps, s)
+        var ret = unicode.unicode_general_category(&s.cr, name)
+        if ret == -1:
+            set_free(s)
+            error(memory.exhausted, "regex: out of memory")
+        if ret < 0:
+            ret = unicode.unicode_prop(&s.cr, name)
+            if ret == -1:
+                set_free(s)
+                error(memory.exhausted, "regex: out of memory")
+        if ret < 0 and not is_inv and allow_sequence_prop:
+            var cr_tmp: unicode.CharRange
+            unicode.cr_init(&cr_tmp, ps.re.heap.opaque, ps.re.heap.realloc_func)
+            var sc = SeqCollect(set = s, failed = false)
+            ret = unicode.unicode_sequence_prop(name, seq_prop_cb, &sc, &cr_tmp)
+            unicode.cr_free(&cr_tmp)
+            if ret == -1 or sc.failed:
+                set_free(s)
+                error(memory.exhausted, "regex: out of memory")
+        if ret < 0:
+            set_free(s)
+            return -2
+    else:
+        return -2
+    return 0
+
+# \p{...} or \P{...} with `ps.p` after the `p`: fills `s`.
+func parse_unicode_property(ps: EsParse*, s: StrSet*, is_inv: bool, allow_sequence_prop: bool) -> !:
+    var name: u8[64]
+    var value: u8[64]
+    if cur(ps) != '{':
+        discard(try es_fail(ps, "expecting '{' after \\p"))
+    ps.p += 1
+    var name_len: usize = 0
+    while is_unicode_char(cur(ps)):
+        if name_len >= name.length - 1:
+            discard(try es_fail(ps, "unknown unicode property name"))
+        name[name_len] = cur(ps)
+        name_len += 1
+        ps.p += 1
+    var value_len: usize = 0
+    if cur(ps) == '=':
+        ps.p += 1
+        while is_unicode_char(cur(ps)):
+            if value_len >= value.length - 1:
+                discard(try es_fail(ps, "unknown unicode property value"))
+            value[value_len] = cur(ps)
+            value_len += 1
+            ps.p += 1
+    if cur(ps) != '}':
+        discard(try es_fail(ps, "expecting '}'"))
+    ps.p += 1
+
+    let ret = try property_lookup(ps, s, (str)name[0..<name_len], (str)value[0..<value_len],
+                                  is_inv, allow_sequence_prop)
+    if ret == -3:
+        discard(try es_fail(ps, "unknown unicode script"))
+    if ret == -4:
+        discard(try es_fail(ps, "unknown unicode general category"))
+    if ret != 0:
+        discard(try es_fail(ps, "unknown unicode property name"))
+
+    # the ordering of case folding and inversion  differs with
+    # unicode_sets. 'unicode_sets' ordering is more consistent
+    # XXX: the spec seems incorrect, we do it as the other engines
+    # seem to do it.
+    errdefer set_free(s)
+    if ps.ignore_case and ps.unicode_sets:
+        try set_canonicalize(ps, s, ps.is_unicode)
+    if is_inv:
+        try cr_check(unicode.cr_invert(&s.cr))
+    if ps.ignore_case and not ps.unicode_sets:
+        try set_canonicalize(ps, s, ps.is_unicode)
+
+# mark: String disjunctions ====================================================================
+
+# \q{...} with `ps.p` after the `q`.
+func parse_class_string_disjunction(ps: EsParse*, s: StrSet*) -> !:
+    if cur(ps) != '{':
+        discard(try es_fail(ps, "expecting '{' after \\q"))
+    var text = Vec[u32](heap = ps.re.heap)
+    defer text.free_all()
+    set_init(ps, s)
+    errdefer set_free(s)
+    ps.p += 1
+    while true:
+        text.used = 0
+        while cur(ps) != '}' and cur(ps) != '|':
+            let c = try get_class_atom(ps, none, false)
+            discard(try text.push((u32)c))
+        try set_add(s, text.data[..<text.used])
+        if cur(ps) == '}':
+            break
+        ps.p += 1
+    if ps.ignore_case:
+        try set_canonicalize(ps, s, true)
+    ps.p += 1 # skip the '}'
+
+# mark: Class atoms ============================================================================
+
+func invalid_escape(ps: EsParse*) -> i32!:
+    return try es_fail(ps, "invalid escape sequence in regular expression")
+
+# A character, or CLASS_RANGE_BASE (or above) when `s` is not none and the atom is a set,
+# which then fills `s`.
+func get_class_atom(ps: EsParse*, s: StrSet*?, inclass: bool) -> i32!:
+    let c0 = cur(ps)
+    var c: u32 = c0
+    var normal_char = false
+    if c0 == '\\':
+        ps.p += 1
+        if ps.p >= ps.src.length:
+            return try es_fail(ps, "unexpected end")
+        c = cur(ps)
+        ps.p += 1
+        var class_range = false
+        var default_escape = false
+        match (u8)c:
+            'd':
+                c = CLASS_d
+                class_range = true
+            'D':
+                c = CLASS_D
+                class_range = true
+            's':
+                c = CLASS_s
+                class_range = true
+            'S':
+                c = CLASS_S
+                class_range = true
+            'w':
+                c = CLASS_w
+                class_range = true
+            'W':
+                c = CLASS_W
+                class_range = true
+            'c':
+                let b = cur(ps)
+                if ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or
+                    (((b >= '0' and b <= '9') or b == '_') and inclass and not ps.is_unicode)):
+                    # Annex B.1.4
+                    c = (u32)(b & 0x1f)
+                    ps.p += 1
+                elif ps.is_unicode:
+                    return try invalid_escape(ps)
+                else:
+                    # otherwise return '\' and 'c'
+                    ps.p -= 1
+                    c = (u32)'\\'
+            '-':
+                if not inclass and ps.is_unicode:
+                    return try invalid_escape(ps)
+            '^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '/':
+                # always valid to escape these characters
+                c = c
+            'p', 'P':
+                default_escape = true
+                if let set = s:
+                    if ps.is_unicode:
+                        default_escape = false
+                        try parse_unicode_property(ps, set, c == (u32)'P', ps.unicode_sets)
+                        c = (u32)CLASS_RANGE_BASE
+            'q':
+                default_escape = true
+                if ps.unicode_sets and inclass:
+                    if let set = s:
+                        default_escape = false
+                        try parse_class_string_disjunction(ps, set)
+                        c = (u32)CLASS_RANGE_BASE
+            _:
+                default_escape = true
+        if class_range:
+            if let set = s:
+                try init_char_range(ps, set, c)
+                c += (u32)CLASS_RANGE_BASE
+            else:
+                default_escape = true
+        if default_escape:
+            ps.p -= 1
+            var q = ps.p
+            let ret = parse_escape(ps.src, &q, (i32)ps.is_unicode * 2)
+            if ret >= 0:
+                ps.p = q
+                c = (u32)ret
+            elif ps.is_unicode:
+                return try invalid_escape(ps)
+            else:
+                # just ignore the '\'
+                normal_char = true
+    elif c0 == 0:
+        if ps.p >= ps.src.length:
+            return try es_fail(ps, "unexpected end")
+        normal_char = true
+    else:
+        match c0:
+            '&', '!', '#', '$', '%', '*', '+', ',', '.', ':', ';', '<', '=', '>', '?', '@', '^', '`', '~':
+                if ps.unicode_sets and ch_at(ps, ps.p + 1) == c0:
+                    # forbidden double characters
+                    return try es_fail(ps, "invalid class set operation in regular expression")
+            '(', ')', '[', ']', '{', '}', '/', '-', '|':
+                if ps.unicode_sets:
+                    # invalid characters in unicode sets
+                    return try es_fail(ps, "invalid character in class in regular expression")
+            _:
+                c = c
+        normal_char = true
+    if normal_char:
+        if c >= 128:
+            var q = ps.p
+            let d = unicode_from_utf8(ps, &q)
+            if d < 0:
+                if ps.is_unicode:
+                    return try es_fail(ps, "")
+                return try es_fail(ps, "malformed unicode char")
+            ps.p = q
+            c = (u32)d
+            if c > 0xffff and not ps.is_unicode:
+                # XXX: should handle non BMP-1 code points
+                return try es_fail(ps, "malformed unicode char")
+        else:
+            ps.p += 1
+    return (i32)c
+
+# mark: Bracketed classes ======================================================================
+
+func es_check_stack(ps: EsParse*) -> !:
+    if let f = ps.check_stack:
+        if f(ps.opaque, 0):
+            discard(try es_fail(ps, "stack overflow"))
+
+# An operand of && or -- (re_parse_class_set_operand): a nested class or one atom.
+func parse_class_set_operand(ps: EsParse*, s: StrSet*) -> !:
+    if cur(ps) == '[':
+        try parse_nested_class(ps, s)
+        return
+    let c1 = try get_class_atom(ps, s, true)
+    if c1 < CLASS_RANGE_BASE:
+        # create a range with a single character
+        set_init(ps, s)
+        var c = (u32)c1
+        if ps.ignore_case:
+            c = (u32)unicode.lre_canonicalize(c, ps.is_unicode)
+        cr_check(unicode.cr_union_interval(&s.cr, c, c)) catch failure:
+            set_free(s)
+            error(failure.code, failure.message)
+
+# re_parse_nested_class, with `ps.p` at the '['.
+func parse_nested_class(ps: EsParse*, s: StrSet*) -> !:
+    try es_check_stack(ps)
+    set_init(ps, s)
+    errdefer set_free(s)
+    ps.p += 1 # skip '['
+    var invert = false
+    if cur(ps) == '^':
+        ps.p += 1
+        invert = true
+    # handle unions
+    var is_first = true
+    var s1: StrSet = ---
+    while true:
+        if cur(ps) == ']':
+            break
+        if cur(ps) == '[' and ps.unicode_sets:
+            try parse_nested_class(ps, &s1)
+            try set_union_free(s, &s1)
+        else:
+            let c1 = try get_class_atom(ps, &s1, true)
+            var atom = true
+            if cur(ps) == '-' and ch_at(ps, ps.p + 1) != ']':
+                var class_atom = false
+                if ch_at(ps, ps.p + 1) == '-' and ps.unicode_sets and is_first:
+                    # first character class followed by '--'
+                    class_atom = true
+                elif c1 >= CLASS_RANGE_BASE:
+                    if ps.is_unicode:
+                        set_free(&s1)
+                        discard(try es_fail(ps, "invalid class range"))
+                    # Annex B: match '-' character
+                    class_atom = true
+                if not class_atom:
+                    let saved = ps.p
+                    ps.p += 1
+                    let c2 = try get_class_atom(ps, &s1, true)
+                    if c2 >= CLASS_RANGE_BASE:
+                        set_free(&s1)
+                        if ps.is_unicode:
+                            discard(try es_fail(ps, "invalid class range"))
+                        # Annex B: match '-' character
+                        ps.p = saved
+                    else:
+                        atom = false
+                        if c2 < c1:
+                            discard(try es_fail(ps, "invalid class range"))
+                        if ps.ignore_case:
+                            var cr2: unicode.CharRange
+                            unicode.cr_init(&cr2, ps.re.heap.opaque, ps.re.heap.realloc_func)
+                            defer unicode.cr_free(&cr2)
+                            try cr_check(unicode.cr_add_interval(&cr2, (u32)c1, (u32)c2 + 1))
+                            try cr_check(unicode.cr_regexp_canonicalize(&cr2, ps.is_unicode))
+                            try cr_check(unicode.cr_op1(&s.cr, unicode.cr_points(&cr2), unicode.cr_op_union))
+                        else:
+                            try cr_check(unicode.cr_union_interval(&s.cr, (u32)c1, (u32)c2))
+                        is_first = false # union operation
+            if atom:
+                if c1 >= CLASS_RANGE_BASE:
+                    try set_union_free(s, &s1)
+                else:
+                    var c = (u32)c1
+                    if ps.ignore_case:
+                        c = (u32)unicode.lre_canonicalize(c, ps.is_unicode)
+                    try cr_check(unicode.cr_union_interval(&s.cr, c, c))
+        if ps.unicode_sets and is_first:
+            if cur(ps) == '&' and ch_at(ps, ps.p + 1) == '&' and ch_at(ps, ps.p + 2) != '&':
+                # handle '&&'
+                while true:
+                    if cur(ps) == ']':
+                        break
+                    elif cur(ps) == '&' and ch_at(ps, ps.p + 1) == '&' and ch_at(ps, ps.p + 2) != '&':
+                        ps.p += 2
+                    else:
+                        discard(try es_fail(ps, "invalid operation in regular expression"))
+                    try parse_class_set_operand(ps, &s1)
+                    try set_op_free(s, &s1, unicode.cr_op_inter)
+            elif cur(ps) == '-' and ch_at(ps, ps.p + 1) == '-':
+                # handle '--'
+                while true:
+                    if cur(ps) == ']':
+                        break
+                    elif cur(ps) == '-' and ch_at(ps, ps.p + 1) == '-':
+                        ps.p += 2
+                    else:
+                        discard(try es_fail(ps, "invalid operation in regular expression"))
+                    try parse_class_set_operand(ps, &s1)
+                    try set_op_free(s, &s1, unicode.cr_op_sub)
+        is_first = false
+    ps.p += 1 # skip ']'
+    if invert:
+        # XXX: add may_contain_string syntax check to be fully
+        # compliant. The test here accepts more input than the
+        # spec.
+        if set_string_count(s) != 0:
+            discard(try es_fail(ps, "negated character class with strings in regular expression debugger eval code"))
+        try cr_check(unicode.cr_invert(&s.cr))
+
+# s = s op s1, then free s1.
+func set_op_free(s: StrSet*, s1: StrSet*, op: i32) -> !:
+    defer set_free(s1)
+    try set_op(s, s1, op)
+
+func set_union_free(s: StrSet*, s1: StrSet*) -> !:
+    try set_op_free(s, s1, unicode.cr_op_union)

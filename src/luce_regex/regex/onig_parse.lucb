@@ -1,0 +1,575 @@
+#==============================================================================================
+#
+#   onig_parse - The Oniguruma front end: pattern text to AST
+#
+#   DESCRIPTION:
+#       The parser of the Oniguruma subset TextMate grammars use: literals, `.`, classes
+#       ([...], ranges, negation, \d \w \s \h and negated forms, a POSIX/\p subset), anchors
+#       (^ $ \b \B \A \G \z \Z), groups (capturing, (?:), named), alternation `|`,
+#       quantifiers (* + ? {n} {n,} {n,m}, greedy and lazy), backreferences (numeric and
+#       named), lookahead and lookbehind, case-insensitive matching, and the inline flags
+#       (?i) (?x) (?s) (?m). It is lenient: an unknown property falls back to the word set so
+#       an exotic grammar still loads.
+#
+#==============================================================================================
+
+# mark: Build ==================================================================================
+
+func onig_build(re: Regex*, pattern: str, ignore_case: bool) -> !:
+    re.ic = ignore_case
+    re.budget = 200000
+    try decode_subj(pattern, &re.pat)
+    let root = try onig_parse_alt(re)
+    if re.pp < re.pat.used:
+        error(syntax_error, "trailing characters in pattern")
+    re.ncap = re.ngroups + 1
+    let ncap = (usize)(2 * re.ncap)
+    re.caps = try alloc i32[ncap] in memory.heap
+    var i: usize = 0
+    while i < ncap:
+        re.caps[i] = -1
+        i += 1
+    try compile_node(re, root, &re.code)
+    discard(try re.code.push(Inst(op = OP_MATCH)))
+    if re.mark_count > 0:
+        re.marks = try alloc i32[(usize)re.mark_count] in memory.heap
+        var m: usize = 0
+        while m < (usize)re.mark_count:
+            re.marks[m] = 0
+            m += 1
+    try compute_first(re)
+    re.pat.free_all()
+    re.nodes.free_all()
+
+# mark: Parser =================================================================================
+
+func onig_cur_cp(re: const Regex*) -> u32:
+    return re.pat.data[re.pp] if re.pp < re.pat.used else 0
+
+func new_node(re: Regex*, kind: u8) -> i32!:
+    var node = Node()
+    node.kind = kind
+    let index = try re.nodes.push(node)
+    return (i32)index
+
+func mk_char(re: Regex*, cp: u32) -> i32!:
+    let n = try new_node(re, K_CHAR)
+    re.nodes.data[(usize)n].ch = cp
+    return n
+
+func mk_anchor(re: Regex*, kind: u8) -> i32!:
+    let n = try new_node(re, K_ANCHOR)
+    re.nodes.data[(usize)n].a = (i32)kind
+    return n
+
+func onig_parse_alt(re: Regex*) -> i32!:
+    let first = try onig_parse_concat(re)
+    var tail = first
+    var count: i32 = 1
+    while re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'|':
+        re.pp += 1
+        let branch = try onig_parse_concat(re)
+        re.nodes.data[(usize)tail].next_sibling = branch
+        tail = branch
+        count += 1
+    if count == 1:
+        return first
+    let node = try new_node(re, K_ALT)
+    re.nodes.data[(usize)node].first_child = first
+    return node
+
+func onig_parse_concat(re: Regex*) -> i32!:
+    var head: i32 = -1
+    var tail: i32 = -1
+    var count: i32 = 0
+    while true:
+        if re.ext:
+            onig_skip_ws(re)
+        if re.pp >= re.pat.used:
+            break
+        let ch = re.pat.data[re.pp]
+        if ch == (u32)'|' or ch == (u32)')':
+            break
+        let part = try onig_parse_repeat(re)
+        if head == -1:
+            head = part
+            tail = part
+        else:
+            re.nodes.data[(usize)tail].next_sibling = part
+            tail = part
+        count += 1
+    if count == 0:
+        return try new_node(re, K_EMPTY)
+    if count == 1:
+        return head
+    let node = try new_node(re, K_CONCAT)
+    re.nodes.data[(usize)node].first_child = head
+    return node
+
+func onig_parse_repeat(re: Regex*) -> i32!:
+    let atom = try onig_parse_atom(re)
+    if re.ext:
+        onig_skip_ws(re)
+    if re.pp >= re.pat.used:
+        return atom
+    let ch = re.pat.data[re.pp]
+    var lo: i32 = 0
+    var hi: i32 = 0
+    var has = false
+    if ch == (u32)'*':
+        lo = 0
+        hi = -1
+        has = true
+        re.pp += 1
+    elif ch == (u32)'+':
+        lo = 1
+        hi = -1
+        has = true
+        re.pp += 1
+    elif ch == (u32)'?':
+        lo = 0
+        hi = 1
+        has = true
+        re.pp += 1
+    elif ch == (u32)'{':
+        let saved = re.pp
+        re.pp += 1
+        var mins: i32 = 0
+        var has_min = false
+        while re.pp < re.pat.used and is_digit(re.pat.data[re.pp]):
+            mins = mins * 10 + (i32)(re.pat.data[re.pp] - (u32)'0')
+            has_min = true
+            re.pp += 1
+        if not has_min:
+            re.pp = saved
+            return atom
+        var maxv: i32 = mins
+        var comma = false
+        if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)',':
+            comma = true
+            re.pp += 1
+            var has_max = false
+            maxv = 0
+            while re.pp < re.pat.used and is_digit(re.pat.data[re.pp]):
+                maxv = maxv * 10 + (i32)(re.pat.data[re.pp] - (u32)'0')
+                has_max = true
+                re.pp += 1
+            if not has_max:
+                maxv = -1
+        if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'}':
+            re.pp += 1
+            lo = mins
+            hi = maxv if comma else mins
+            has = true
+        else:
+            re.pp = saved
+            return atom
+    if not has:
+        return atom
+    var greedy = true
+    if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'?':
+        greedy = false
+        re.pp += 1
+    elif re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'+':
+        re.pp += 1
+    let node = try new_node(re, K_REPEAT)
+    re.nodes.data[(usize)node].a = lo
+    re.nodes.data[(usize)node].b = hi
+    re.nodes.data[(usize)node].greedy = greedy
+    re.nodes.data[(usize)node].first_child = atom
+    return node
+
+func onig_parse_atom(re: Regex*) -> i32!:
+    if re.ext:
+        onig_skip_ws(re)
+    if re.pp >= re.pat.used:
+        return try new_node(re, K_EMPTY)
+    let ch = re.pat.data[re.pp]
+    if ch == (u32)'(':
+        return try onig_parse_group(re)
+    if ch == (u32)'[':
+        return try onig_parse_class(re)
+    if ch == (u32)'.':
+        re.pp += 1
+        return try new_node(re, K_ANY)
+    if ch == (u32)'^':
+        re.pp += 1
+        return try mk_anchor(re, AN_BOL)
+    if ch == (u32)'$':
+        re.pp += 1
+        return try mk_anchor(re, AN_EOL)
+    if ch == (u32)'\\':
+        return try onig_parse_escape(re)
+    re.pp += 1
+    return try mk_char(re, ch)
+
+func onig_parse_group(re: Regex*) -> i32!:
+    re.pp += 1
+    if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'?':
+        re.pp += 1
+        let c = onig_cur_cp(re)
+        if c == (u32)':':
+            re.pp += 1
+            return try onig_grouped(re, 0)
+        if c == (u32)'=':
+            re.pp += 1
+            return try onig_parse_look(re, true, false)
+        if c == (u32)'!':
+            re.pp += 1
+            return try onig_parse_look(re, true, true)
+        if c == (u32)'>':
+            re.pp += 1
+            return try onig_grouped(re, 0)
+        if c == (u32)'<':
+            re.pp += 1
+            let d = onig_cur_cp(re)
+            if d == (u32)'=':
+                re.pp += 1
+                return try onig_parse_look(re, false, false)
+            if d == (u32)'!':
+                re.pp += 1
+                return try onig_parse_look(re, false, true)
+            let span = try onig_read_name(re, (u32)'>')
+            return try onig_parse_named(re, span)
+        if c == (u32)'\'':
+            re.pp += 1
+            let span = try onig_read_name(re, (u32)'\'')
+            return try onig_parse_named(re, span)
+        return try onig_parse_flags(re)
+    re.ngroups += 1
+    let index = re.ngroups
+    return try onig_grouped(re, index)
+
+func onig_grouped(re: Regex*, index: i32) -> i32!:
+    let inner = try onig_parse_alt(re)
+    try onig_expect(re, (u32)')')
+    let node = try new_node(re, K_GROUP)
+    re.nodes.data[(usize)node].a = index
+    re.nodes.data[(usize)node].first_child = inner
+    return node
+
+func onig_parse_named(re: Regex*, name: Span) -> i32!:
+    re.ngroups += 1
+    let index = re.ngroups
+    discard(try re.names.push(NameEntry(start = name.start, len = name.len, group = index)))
+    return try onig_grouped(re, index)
+
+func onig_parse_look(re: Regex*, ahead: bool, negate: bool) -> i32!:
+    let inner = try onig_parse_alt(re)
+    try onig_expect(re, (u32)')')
+    let node = try new_node(re, K_LOOK)
+    re.nodes.data[(usize)node].ahead = ahead
+    re.nodes.data[(usize)node].negate = negate
+    re.nodes.data[(usize)node].first_child = inner
+    return node
+
+func onig_parse_flags(re: Regex*) -> i32!:
+    var on = true
+    while re.pp < re.pat.used:
+        let c = re.pat.data[re.pp]
+        if c == (u32)':' or c == (u32)')':
+            break
+        if c == (u32)'-':
+            on = false
+        elif c == (u32)'i':
+            if on:
+                re.ic = true
+        elif c == (u32)'s':
+            if on:
+                re.dotall = true
+        elif c == (u32)'m':
+            if on:
+                re.multi = true
+        elif c == (u32)'x':
+            re.ext = on
+        re.pp += 1
+    if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)':':
+        re.pp += 1
+        return try onig_grouped(re, 0)
+    try onig_expect(re, (u32)')')
+    return try new_node(re, K_EMPTY)
+
+func onig_parse_escape(re: Regex*) -> i32!:
+    re.pp += 1
+    if re.pp >= re.pat.used:
+        return try mk_char(re, (u32)'\\')
+    let c = re.pat.data[re.pp]
+    re.pp += 1
+    if is_builtin(c):
+        let ci = try new_class(re, false, builtin_bit(c))
+        return try class_node(re, ci)
+    if c == (u32)'b':
+        return try mk_anchor(re, AN_WORDB)
+    if c == (u32)'B':
+        return try mk_anchor(re, AN_NWORDB)
+    if c == (u32)'A':
+        return try mk_anchor(re, AN_BUFS)
+    if c == (u32)'G':
+        re.has_g = true
+        return try mk_anchor(re, AN_G)
+    if c == (u32)'z' or c == (u32)'Z':
+        return try mk_anchor(re, AN_BUFE)
+    if is_digit(c) and c != (u32)'0':
+        var ds: i32 = (i32)(c - (u32)'0')
+        while re.pp < re.pat.used and is_digit(re.pat.data[re.pp]):
+            ds = ds * 10 + (i32)(re.pat.data[re.pp] - (u32)'0')
+            re.pp += 1
+        let n = try new_node(re, K_BACKREF)
+        re.nodes.data[(usize)n].a = ds
+        return n
+    if c == (u32)'k' and re.pp < re.pat.used and (re.pat.data[re.pp] == (u32)'<' or re.pat.data[re.pp] == (u32)'\''):
+        let term = (u32)'>' if re.pat.data[re.pp] == (u32)'<' else (u32)'\''
+        re.pp += 1
+        let span = try onig_read_name(re, term)
+        let n = try new_node(re, K_BACKREF)
+        re.nodes.data[(usize)n].a = onig_find_name(re, span)
+        return n
+    if c == (u32)'p' or c == (u32)'P':
+        let ci = try new_class(re, c == (u32)'P', 0)
+        let span = try onig_read_property(re)
+        try onig_add_property(re, ci, span)
+        return try class_node(re, ci)
+    let n = try new_node(re, K_CHAR)
+    re.nodes.data[(usize)n].ch = onig_decode_escape(re, c)
+    return n
+
+func onig_parse_class(re: Regex*) -> i32!:
+    re.pp += 1
+    var negate = false
+    if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'^':
+        negate = true
+        re.pp += 1
+    let ci = try new_class(re, negate, 0)
+    var first = true
+    while re.pp < re.pat.used:
+        let ch = re.pat.data[re.pp]
+        if ch == (u32)']' and not first:
+            break
+        first = false
+        if ch == (u32)'[' and re.pp + 1 < re.pat.used and re.pat.data[re.pp + 1] == (u32)':':
+            try onig_parse_posix(re, ci)
+            continue
+        if ch == (u32)'\\':
+            let lit = try onig_class_escape(re, ci)
+            if lit >= 0:
+                try onig_maybe_range(re, ci, (u32)lit)
+            continue
+        re.pp += 1
+        try onig_maybe_range(re, ci, ch)
+    try onig_expect(re, (u32)']')
+    return try class_node(re, ci)
+
+func onig_maybe_range(re: Regex*, ci: i32, lo: u32) -> !:
+    if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'-' and re.pp + 1 < re.pat.used and re.pat.data[re.pp + 1] != (u32)']':
+        re.pp += 1
+        var hi: u32 = 0
+        if re.pat.data[re.pp] == (u32)'\\':
+            hi = try onig_class_escape_char(re)
+        else:
+            hi = re.pat.data[re.pp]
+            re.pp += 1
+        try add_range(re, ci, lo, hi)
+    else:
+        try add_range(re, ci, lo, lo)
+
+func onig_class_escape(re: Regex*, ci: i32) -> i32!:
+    re.pp += 1
+    if re.pp >= re.pat.used:
+        return (i32)(u32)'\\'
+    let c = re.pat.data[re.pp]
+    re.pp += 1
+    if is_builtin(c):
+        onig_add_builtin(re, ci, builtin_bit(c))
+        return -1
+    if c == (u32)'p' or c == (u32)'P':
+        let span = try onig_read_property(re)
+        try onig_add_property(re, ci, span)
+        return -1
+    return (i32)onig_decode_escape(re, c)
+
+func onig_class_escape_char(re: Regex*) -> u32!:
+    re.pp += 1
+    if re.pp >= re.pat.used:
+        return (u32)'\\'
+    let c = re.pat.data[re.pp]
+    re.pp += 1
+    return onig_decode_escape(re, c)
+
+## The literal codepoint a simple escape denotes.
+func onig_decode_escape(re: Regex*, c: u32) -> u32:
+    if c == (u32)'n':
+        return 10
+    if c == (u32)'t':
+        return 9
+    if c == (u32)'r':
+        return 13
+    if c == (u32)'f':
+        return 12
+    if c == (u32)'v':
+        return 11
+    if c == (u32)'0':
+        return 0
+    if c == (u32)'a':
+        return 7
+    if c == (u32)'e':
+        return 27
+    if c == (u32)'b':
+        return 8
+    if c == (u32)'x':
+        return onig_read_hex(re, 2)
+    if c == (u32)'u':
+        return onig_read_hex(re, 4)
+    return c
+
+func onig_read_hex(re: Regex*, fixed: i32) -> u32:
+    var value: u32 = 0
+    if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'{':
+        re.pp += 1
+        while re.pp < re.pat.used and re.pat.data[re.pp] != (u32)'}':
+            value = value * 16 + (u32)hex_digit(re.pat.data[re.pp])
+            re.pp += 1
+        if re.pp < re.pat.used:
+            re.pp += 1
+    else:
+        var n: i32 = 0
+        while n < fixed and re.pp < re.pat.used and is_hex(re.pat.data[re.pp]):
+            value = value * 16 + (u32)hex_digit(re.pat.data[re.pp])
+            re.pp += 1
+            n += 1
+    return value
+
+func onig_parse_posix(re: Regex*, ci: i32) -> !:
+    re.pp += 2
+    let start = (i32)re.name_cps.used
+    var len: i32 = 0
+    while re.pp < re.pat.used and re.pat.data[re.pp] != (u32)':':
+        discard(try re.name_cps.push(re.pat.data[re.pp]))
+        len += 1
+        re.pp += 1
+    if re.pp < re.pat.used:
+        re.pp += 1
+    if re.pp < re.pat.used:
+        re.pp += 1
+    try onig_add_property(re, ci, Span(start = start, len = len))
+
+func onig_read_property(re: Regex*) -> Span!:
+    let start = (i32)re.name_cps.used
+    var len: i32 = 0
+    if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'{':
+        re.pp += 1
+        while re.pp < re.pat.used and re.pat.data[re.pp] != (u32)'}':
+            discard(try re.name_cps.push(re.pat.data[re.pp]))
+            len += 1
+            re.pp += 1
+        if re.pp < re.pat.used:
+            re.pp += 1
+    elif re.pp < re.pat.used:
+        discard(try re.name_cps.push(re.pat.data[re.pp]))
+        len += 1
+        re.pp += 1
+    return Span(start = start, len = len)
+
+## Map a POSIX or Unicode property name to an ASCII approximation. Never fails: an unknown
+## name falls back to the word set, so an exotic grammar still loads.
+func onig_add_property(re: Regex*, ci: i32, name: Span) -> !:
+    if onig_name_is(re, name, "digit") or onig_name_is(re, name, "Digit") or onig_name_is(re, name, "Nd") or onig_name_is(re, name, "Number"):
+        onig_add_builtin(re, ci, B_d)
+    elif onig_name_is(re, name, "space") or onig_name_is(re, name, "Space") or onig_name_is(re, name, "White_Space"):
+        onig_add_builtin(re, ci, B_s)
+    elif onig_name_is(re, name, "xdigit") or onig_name_is(re, name, "XDigit"):
+        onig_add_builtin(re, ci, B_h)
+    elif onig_name_is(re, name, "upper") or onig_name_is(re, name, "Upper") or onig_name_is(re, name, "Lu"):
+        try add_range(re, ci, (u32)'A', (u32)'Z')
+    elif onig_name_is(re, name, "lower") or onig_name_is(re, name, "Lower") or onig_name_is(re, name, "Ll"):
+        try add_range(re, ci, (u32)'a', (u32)'z')
+    elif onig_name_is(re, name, "alpha") or onig_name_is(re, name, "Alpha") or onig_name_is(re, name, "Alphabetic") or onig_name_is(re, name, "L") or onig_name_is(re, name, "Letter"):
+        try add_range(re, ci, (u32)'A', (u32)'Z')
+        try add_range(re, ci, (u32)'a', (u32)'z')
+    elif onig_name_is(re, name, "alnum") or onig_name_is(re, name, "Alnum"):
+        onig_add_builtin(re, ci, B_d)
+        try add_range(re, ci, (u32)'A', (u32)'Z')
+        try add_range(re, ci, (u32)'a', (u32)'z')
+    elif onig_name_is(re, name, "punct") or onig_name_is(re, name, "Punct"):
+        try add_range(re, ci, (u32)'!', (u32)'/')
+        try add_range(re, ci, (u32)':', (u32)'@')
+        try add_range(re, ci, (u32)'[', (u32)'`')
+        try add_range(re, ci, (u32)'{', (u32)'~')
+    else:
+        onig_add_builtin(re, ci, B_w)
+
+func new_class(re: Regex*, negate: bool, builtins: u32) -> i32!:
+    var cc = CharClass()
+    cc.negate = negate
+    cc.builtins = builtins
+    cc.range_start = re.ranges.used
+    cc.range_count = 0
+    let index = try re.classes.push(cc)
+    return (i32)index
+
+func onig_add_builtin(re: Regex*, ci: i32, bit: u32):
+    re.classes.data[(usize)ci].builtins = re.classes.data[(usize)ci].builtins | bit
+
+func add_range(re: Regex*, ci: i32, lo: u32, hi: u32) -> !:
+    discard(try re.ranges.push(lo))
+    discard(try re.ranges.push(hi))
+    re.classes.data[(usize)ci].range_count += 1
+
+func class_node(re: Regex*, ci: i32) -> i32!:
+    let n = try new_node(re, K_CLASS)
+    re.nodes.data[(usize)n].a = ci
+    return n
+
+func onig_read_name(re: Regex*, term: u32) -> Span!:
+    let start = (i32)re.name_cps.used
+    var len: i32 = 0
+    while re.pp < re.pat.used and re.pat.data[re.pp] != term:
+        discard(try re.name_cps.push(re.pat.data[re.pp]))
+        len += 1
+        re.pp += 1
+    try onig_expect(re, term)
+    return Span(start = start, len = len)
+
+func onig_find_name(re: const Regex*, span: Span) -> i32:
+    var i: usize = 0
+    while i < re.names.used:
+        let entry = re.names.data[i]
+        if entry.len == span.len and onig_span_eq(re, entry.start, span):
+            return entry.group
+        i += 1
+    return 0
+
+func onig_span_eq(re: const Regex*, a_start: i32, b: Span) -> bool:
+    var i: i32 = 0
+    while i < b.len:
+        if re.name_cps.data[(usize)(a_start + i)] != re.name_cps.data[(usize)(b.start + i)]:
+            return false
+        i += 1
+    return true
+
+func onig_name_is(re: const Regex*, span: Span, lit: str) -> bool:
+    let bytes = lit.bytes
+    if (usize)span.len != bytes.length:
+        return false
+    var i: usize = 0
+    while i < (usize)span.len:
+        if re.name_cps.data[(usize)span.start + i] != (u32)bytes[i]:
+            return false
+        i += 1
+    return true
+
+func onig_expect(re: Regex*, cp: u32) -> !:
+    if re.pp < re.pat.used and re.pat.data[re.pp] == cp:
+        re.pp += 1
+        return
+    error(syntax_error, "missing a delimiter in pattern")
+
+func onig_skip_ws(re: Regex*):
+    while re.pp < re.pat.used:
+        let c = re.pat.data[re.pp]
+        if c == (u32)' ' or c == (u32)'\t' or c == (u32)'\n' or c == (u32)'\r':
+            re.pp += 1
+        elif c == (u32)'#':
+            while re.pp < re.pat.used and re.pat.data[re.pp] != (u32)'\n':
+                re.pp += 1
+        else:
+            break

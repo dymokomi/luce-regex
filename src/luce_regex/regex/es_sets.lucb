@@ -1,0 +1,304 @@
+#==============================================================================================
+#
+#   es_sets - ECMAScript class sets: code points plus, with the v flag, strings
+#
+#   DESCRIPTION:
+#       The counterpart of libregexp.c's REStringList (lines 132-460): a set is a
+#       `unicode.CharRange` of code points plus a hash set of the strings whose length is
+#       not one (the v flag's \q{...} and sequence properties such as \p{RGI_Emoji}), with
+#       the union, intersection and difference of class set operations, and Canonicalize
+#       for the i flag. The \d \s \w ranges live here too. A finished set becomes a class,
+#       or, when it holds strings, an alternation that tries the longest strings first.
+#
+#==============================================================================================
+
+# mark: The set ================================================================================
+
+struct StrSet:
+    var cr: unicode.CharRange
+    # the strings: at offs[i] in `pool`, a length followed by that many code points
+    var pool: Vec[u32]
+    var offs: Vec[i32]
+    # open-addressed hash buckets holding indexes into `offs`, -1 when empty
+    var table: Vec[i32]
+
+func set_init(ps: const EsParse*, s: StrSet*):
+    let heap = ps.re.heap
+    unicode.cr_init(&s.cr, heap.opaque, heap.realloc_func)
+    s.pool = Vec[u32](heap = heap)
+    s.offs = Vec[i32](heap = heap)
+    s.table = Vec[i32](heap = heap)
+
+func set_free(s: StrSet*):
+    unicode.cr_free(&s.cr)
+    s.pool.free_all()
+    s.offs.free_all()
+    s.table.free_all()
+
+func cr_check(ret: i32) -> !:
+    if ret != 0:
+        error(memory.exhausted, "regex: out of memory")
+
+func set_string_count(s: const StrSet*) -> usize:
+    return s.offs.used
+
+func str_hash(cps: const u32[]) -> u32:
+    var h: u32 = 1
+    for c in cps:
+        h = h *% 263 +% c
+    return h *% 0x61C88647
+
+# The code points of string `i` of the set.
+func set_string(s: const StrSet*, i: usize) -> const u32[]:
+    let off = (usize)s.offs.data[i]
+    let n = (usize)s.pool.data[off]
+    return s.pool.data[off + 1 ..< off + 1 + n]
+
+func same_cps(a: const u32[], b: const u32[]) -> bool:
+    if a.length != b.length:
+        return false
+    var i: usize = 0
+    while i < a.length:
+        if a[i] != b[i]:
+            return false
+        i += 1
+    return true
+
+# The bucket of `cps`: where it is, or the empty bucket where it would go.
+func set_bucket(s: const StrSet*, cps: const u32[]) -> usize:
+    let mask = s.table.used - 1
+    var h = (usize)(str_hash(cps)) & mask
+    while true:
+        let e = s.table.data[h]
+        if e < 0 or same_cps(set_string(s, (usize)e), cps):
+            return h
+        h = (h + 1) & mask
+    return 0
+
+func set_has_string(s: const StrSet*, cps: const u32[]) -> bool:
+    if s.offs.used == 0:
+        return false
+    return s.table.data[set_bucket(s, cps)] >= 0
+
+# Rebuild the hash buckets for the strings in `offs`, with room to grow.
+func set_rehash(s: StrSet*, want: usize) -> !:
+    var size: usize = 16
+    while size < 2 * want:
+        size *= 2
+    s.table.used = 0
+    try s.table.ensure(size)
+    s.table.used = size
+    var i: usize = 0
+    while i < size:
+        s.table.data[i] = -1
+        i += 1
+    var k: usize = 0
+    while k < s.offs.used:
+        s.table.data[set_bucket(s, set_string(s, k))] = (i32)k
+        k += 1
+
+func set_add_string(s: StrSet*, cps: const u32[]) -> !:
+    if set_has_string(s, cps):
+        return
+    if 2 * (s.offs.used + 1) > s.table.used:
+        try set_rehash(s, s.offs.used + 1)
+    let off = try s.pool.push((u32)cps.length)
+    for c in cps:
+        discard(try s.pool.push(c))
+    let index = try s.offs.push((i32)off)
+    s.table.data[set_bucket(s, cps)] = (i32)index
+
+# re_string_add: a one-character string joins the code points.
+func set_add(s: StrSet*, cps: const u32[]) -> !:
+    if cps.length == 1:
+        try cr_check(unicode.cr_union_interval(&s.cr, cps[0], cps[0]))
+        return
+    try set_add_string(s, cps)
+
+# a = a op b (unicode.cr_op_union, cr_op_inter or cr_op_sub)
+func set_op(a: StrSet*, b: const StrSet*, op: i32) -> !:
+    try cr_check(unicode.cr_op1(&a.cr, unicode.cr_points(&b.cr), op))
+    if op == unicode.cr_op_union:
+        var i: usize = 0
+        while i < b.offs.used:
+            try set_add_string(a, set_string(b, i))
+            i += 1
+        return
+    # intersection or difference: keep the strings of `a` that are (not) in `b`
+    var kept: usize = 0
+    var i: usize = 0
+    while i < a.offs.used:
+        var keep = set_has_string(b, set_string(a, i))
+        if op == unicode.cr_op_sub:
+            keep = not keep
+        if keep:
+            a.offs.data[kept] = a.offs.data[i]
+            kept += 1
+        i += 1
+    if kept != a.offs.used:
+        a.offs.used = kept
+        try set_rehash(a, kept)
+
+# re_string_list_canonicalize
+func set_canonicalize(ps: const EsParse*, s: StrSet*, is_unicode: bool) -> !:
+    try cr_check(unicode.cr_regexp_canonicalize(&s.cr, is_unicode))
+    if s.offs.used == 0:
+        return
+    var old: StrSet = ---
+    set_init(ps, &old)
+    defer set_free(&old)
+    # move the strings aside, then add them back canonicalized
+    let pool = old.pool
+    old.pool = s.pool
+    s.pool = pool
+    let offs = old.offs
+    old.offs = s.offs
+    s.offs = offs
+    s.table.used = 0
+    var buf = Vec[u32](heap = ps.re.heap)
+    defer buf.free_all()
+    var i: usize = 0
+    while i < old.offs.used:
+        let cps = set_string(&old, i)
+        buf.used = 0
+        for c in cps:
+            discard(try buf.push((u32)unicode.lre_canonicalize(c, is_unicode)))
+        try set_add(s, buf.data[..<buf.used])
+        i += 1
+
+# mark: Class escapes ==========================================================================
+
+# \d, \s and \w as [low, high + 1) bounds.
+let char_range_d: u32[2] = [0x0030, 0x0039 + 1]
+
+# code point ranges for Zs,Zl or Zp property
+let char_range_s: u32[20] = [
+    0x0009, 0x000D + 1,
+    0x0020, 0x0020 + 1,
+    0x00A0, 0x00A0 + 1,
+    0x1680, 0x1680 + 1,
+    0x2000, 0x200A + 1,
+    # 2028;LINE SEPARATOR;Zl;0;WS;;;;;N;;;;;
+    # 2029;PARAGRAPH SEPARATOR;Zp;0;B;;;;;N;;;;;
+    0x2028, 0x2029 + 1,
+    0x202F, 0x202F + 1,
+    0x205F, 0x205F + 1,
+    0x3000, 0x3000 + 1,
+    # FEFF;ZERO WIDTH NO-BREAK SPACE;Cf;0;BN;;;;;N;BYTE ORDER MARK;;;;
+    0xFEFF, 0xFEFF + 1,
+]
+
+let char_range_w: u32[8] = [
+    0x0030, 0x0039 + 1,
+    0x0041, 0x005A + 1,
+    0x005F, 0x005F + 1,
+    0x0061, 0x007A + 1,
+]
+
+# CharRangeEnum: bit 0 is the inversion (\D \S \W), the rest selects d, s or w.
+let CLASS_d: u32 = 0
+let CLASS_D: u32 = 1
+let CLASS_s: u32 = 2
+let CLASS_S: u32 = 3
+let CLASS_w: u32 = 4
+let CLASS_W: u32 = 5
+
+# get_class_atom's answer for a set rather than a character.
+let CLASS_RANGE_BASE: i32 = 0x40000000
+
+# cr_init_char_range
+func init_char_range(ps: const EsParse*, s: StrSet*, c: u32) -> !:
+    set_init(ps, s)
+    var points: const u32[] = char_range_d
+    if (c >> 1) == 1:
+        points = char_range_s
+    elif (c >> 1) == 2:
+        points = char_range_w
+    for v in points:
+        try cr_check(unicode.cr_add_point(&s.cr, v))
+    if (c & 1) != 0:
+        try cr_check(unicode.cr_invert(&s.cr))
+
+# mark: To the AST =============================================================================
+
+# A class of the program holding the code points of `cr`.
+func es_new_class(re: Regex*, cr: const unicode.CharRange*) -> i32!:
+    let points = unicode.cr_points(cr)
+    var cc = CharClass()
+    cc.range_start = re.ranges.used
+    var i: usize = 0
+    while i + 1 < points.length:
+        discard(try re.ranges.push(points[i]))
+        discard(try re.ranges.push(points[i + 1] - 1))
+        i += 2
+    cc.range_count = points.length // 2
+    let index = try re.classes.push(cc)
+    return (i32)index
+
+# The node matching set `s` (re_emit_string_list): a class, or, with strings, an alternation
+# of the strings from the longest to the shortest, then the class, then the empty string.
+func set_to_node(ps: EsParse*, s: const StrSet*) -> i32!:
+    let flags = F_IC if ps.ignore_case else (u8)0
+    let re = ps.re
+    if s.offs.used == 0:
+        let n = try new_node(re, K_CLASS)
+        re.nodes.data[(usize)n].a = try es_new_class(re, &s.cr)
+        re.nodes.data[(usize)n].flags = flags
+        return n
+    var max_len: usize = 0
+    var has_empty = false
+    var i: usize = 0
+    while i < s.offs.used:
+        let n = set_string(s, i).length
+        if n == 0:
+            has_empty = true
+        if n > max_len:
+            max_len = n
+        i += 1
+    var head: i32 = -1
+    var tail: i32 = -1
+    var len = max_len
+    while len > 0:
+        var k: usize = 0
+        while k < s.offs.used:
+            let cps = set_string(s, k)
+            if cps.length == len:
+                let alt = try es_chars_node(ps, cps, flags)
+                try link_sibling(re, &head, &tail, alt)
+            k += 1
+        len -= 1
+    if unicode.cr_points(&s.cr).length != 0:
+        let n = try new_node(re, K_CLASS)
+        re.nodes.data[(usize)n].a = try es_new_class(re, &s.cr)
+        re.nodes.data[(usize)n].flags = flags
+        try link_sibling(re, &head, &tail, n)
+    if has_empty:
+        try link_sibling(re, &head, &tail, try new_node(re, K_EMPTY))
+    if head == tail:
+        return head
+    let node = try new_node(re, K_ALT)
+    re.nodes.data[(usize)node].first_child = head
+    return node
+
+# The concatenation of the characters `cps`.
+func es_chars_node(ps: EsParse*, cps: const u32[], flags: u8) -> i32!:
+    let re = ps.re
+    var head: i32 = -1
+    var tail: i32 = -1
+    for c in cps:
+        let n = try mk_char(re, c)
+        re.nodes.data[(usize)n].flags = flags
+        try link_sibling(re, &head, &tail, n)
+    if head == tail:
+        return head
+    let node = try new_node(re, K_CONCAT)
+    re.nodes.data[(usize)node].first_child = head
+    return node
+
+# Append `n` to the sibling list (head, tail).
+func link_sibling(re: Regex*, head: i32*, tail: i32*, n: i32) -> !:
+    if *head < 0:
+        *head = n
+    else:
+        re.nodes.data[(usize)*tail].next_sibling = n
+    *tail = n

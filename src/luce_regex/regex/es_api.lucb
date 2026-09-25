@@ -1,0 +1,377 @@
+#==============================================================================================
+#
+#   es_api - The ECMAScript dialect's public interface
+#
+#   DESCRIPTION:
+#       What a JavaScript engine needs for RegExp, shaped like QuickJS's lre_compile /
+#       lre_exec so luce-js can call it where it called libregexp:
+#
+#       - `compile_ecmascript(pattern, flags, message, host)` compiles a pattern given as
+#         UTF-8 bytes (with the u or v flag) or CESU-8 bytes (each UTF-16 code unit encoded
+#         alone, as QuickJS's JS_ToCStringLen2 produces without them); lone surrogates are
+#         three-byte sequences. `compile_ecmascript16` takes the pattern as UTF-16 code units
+#         and encodes it that way. The program is answered, or none with QuickJS's syntax
+#         error message (NUL-terminated, truncated) in `message`.
+#       - `capture_count`, `program_flags` and `group_names` describe the program.
+#       - `exec8` / `exec16` match a Latin-1 or UTF-16 subject from a start index (a code
+#         unit index; with u or v, an index inside a surrogate pair starts at the pair).
+#         Without y the leftmost match at or after it is found; with y only one at it. The
+#         answer is 1 (match: `captures` holds each group's start and end code unit index,
+#         or -1 for a group that did not participate), 0 (no match), -1 (out of memory) or
+#         -2 (the host's check_timeout asked to stop).
+#       - `free_ecmascript` releases a program.
+#
+#       The host's callbacks: check_stack_overflow(opaque, 0) is asked at each nested
+#       disjunction and class while compiling (true fails the compile with "stack
+#       overflow"; matching is iterative and needs no such check); check_timeout(opaque) is
+#       polled every 10000 steps of a match; realloc_func(opaque, ptr, size), with C realloc
+#       semantics, provides all the program's memory, including the backtracking stacks an
+#       exec grows (C's realloc when none). The host given to compile_ecmascript supplies
+#       the allocator for the program's whole life; exec takes a host for check_timeout.
+#
+#==============================================================================================
+
+# mark: The host ===============================================================================
+
+## The callbacks an ECMAScript program's compile and exec use; every one is optional.
+## QuickJS passes its JSContext as `opaque`.
+pub struct Host:
+    ## Passed as the first argument of every callback.
+    pub var opaque: void*? = none
+    ## `(opaque, size)`: true if the native stack is about to overflow; the compiler then
+    ## fails with "stack overflow".
+    pub var check_stack_overflow: (func(void*?, usize) -> bool)? = none
+    ## `(opaque)`: true if the match must stop; exec then answers -2.
+    pub var check_timeout: (func(void*?) -> bool)? = none
+    ## `(opaque, ptr, size)` with C `realloc` semantics: the program's allocator.
+    pub var realloc_func: ReallocFunc? = none
+
+## exec's answer: a match.
+pub let exec_match: i32 = 1
+## exec's answer: no match.
+pub let exec_no_match: i32 = 0
+## exec's answer: an allocation failed.
+pub let exec_out_of_memory: i32 = -1
+## exec's answer: the host's check_timeout asked to stop.
+pub let exec_interrupted: i32 = -2
+
+# mark: Compiling ==============================================================================
+
+# Every field of a fresh ECMAScript program allocating through `heap`.
+func es_reset(re: Regex*, heap: Heap):
+    re.pat = Vec[u32](heap = heap)
+    re.pp = 0
+    re.nodes = Vec[Node](heap = heap)
+    re.ic = false
+    re.ext = false
+    re.dotall = false
+    re.multi = false
+    re.ngroups = 0
+    re.name_cps = Vec[u32](heap = heap)
+    re.names = Vec[NameEntry](heap = heap)
+    re.classes = Vec[CharClass](heap = heap)
+    re.ranges = Vec[u32](heap = heap)
+    re.code = Vec[Inst](heap = heap)
+    re.subprogs = Vec[Program](heap = heap)
+    re.mark_count = 0
+    var empty: i32[]
+    re.marks = empty
+    re.caps = empty
+    re.has_g = false
+    re.first_any = false
+    re.first_chars = Vec[u32](heap = heap)
+    re.first_classes = Vec[i32](heap = heap)
+    re.len = 0
+    re.anchor = 0
+    re.steps = 0
+    re.budget = 10000
+    re.stacks = stacks_on(heap)
+    re.text_subj = Vec[u32](heap = heap)
+    re.es = true
+    re.es_flags = 0
+    re.unicode = false
+    re.ncap = 1
+    re.nregs = 0
+    re.reg_depth = 0
+    re.group_names = Vec[u8](heap = heap)
+    re.ref_lists = Vec[i32](heap = heap)
+    re.heap = heap
+    re.check_timeout = none
+    re.host_opaque = none
+    re.first_chars_i = Vec[u32](heap = heap)
+
+# pstrcpy into the caller's buffer.
+func copy_message(out: u8[], text: const u8[]):
+    if out.length == 0:
+        return
+    var n = text.length
+    if n > out.length - 1:
+        n = out.length - 1
+    var i: usize = 0
+    while i < n:
+        out[i] = text[i]
+        i += 1
+    out[n] = 0
+
+## Compile the ECMAScript `pattern` (UTF-8 with the u or v flag, CESU-8 without; see the
+## module notes) with `flags` (es_global, es_ignore_case, ...). Answers the program, or none
+## with the syntax error in `message` (NUL-terminated, truncated to fit). Free the program
+## with `free_ecmascript`.
+pub func compile_ecmascript(pattern: const u8[], flags: i32, message: u8[], host: const Host*?) -> Regex*?:
+    var heap = Heap(realloc_func = c_heap_realloc, opaque = none)
+    var check_stack: (func(void*?, usize) -> bool)? = none
+    if let h = host:
+        heap.opaque = h.opaque
+        if let rf = h.realloc_func:
+            heap.realloc_func = rf
+        check_stack = h.check_stack_overflow
+    let rf = heap.realloc_func else trap("unreachable")
+    let mem = rf(heap.opaque, none, sizeof(Regex))
+    if mem == none:
+        copy_message(message, "out of memory".bytes)
+        return none
+    let re = (Regex*)(mem else trap("unreachable"))
+    es_reset(re, heap)
+    var ps = EsParse(re = re, src = pattern, p = 0)
+    ps.is_unicode = (flags & (es_unicode | es_unicode_sets)) != 0
+    ps.unicode_sets = (flags & es_unicode_sets) != 0
+    ps.ignore_case = (flags & es_ignore_case) != 0
+    ps.multi_line = (flags & es_multiline) != 0
+    ps.dotall = (flags & es_dotall) != 0
+    ps.capture_count = 1
+    ps.total_capture_count = -1
+    ps.has_named_captures = -1
+    ps.check_stack = check_stack
+    ps.opaque = heap.opaque
+    es_build(&ps, flags) catch failure:
+        if failure.code == syntax_error:
+            copy_message(message, ps.message[0..<ps.message_len])
+        else:
+            copy_message(message, "out of memory".bytes)
+        free_ecmascript(re)
+        return none
+    copy_message(message, "".bytes)
+    return re
+
+## `compile_ecmascript` for a pattern given as UTF-16 code units (a JavaScript string):
+## encoded as UTF-8 with the u or v flag (a surrogate pair as one code point) and as
+## CESU-8 without, as QuickJS encodes it.
+pub func compile_ecmascript16(pattern: const u16[], flags: i32, message: u8[], host: const Host*?) -> Regex*?:
+    let pairs = (flags & (es_unicode | es_unicode_sets)) != 0
+    let bytes = alloc u8[pattern.length * 3 + 1] in memory.heap catch failure:
+        copy_message(message, "out of memory".bytes)
+        return none
+    defer free(bytes) in memory.heap
+    var n: usize = 0
+    var i: usize = 0
+    while i < pattern.length:
+        var c = (u32)pattern[i]
+        i += 1
+        if pairs and is_hi_surrogate(c) and i < pattern.length and is_lo_surrogate((u32)pattern[i]):
+            c = from_surrogate(c, (u32)pattern[i])
+            i += 1
+        n += utf8_encode(bytes[n..], c)
+    return compile_ecmascript(bytes[..<n], flags, message, host)
+
+func es_build(ps: EsParse*, flags: i32) -> !:
+    let re = ps.re
+    re.es_flags = flags
+    re.unicode = ps.is_unicode
+    let root = try es_parse_disjunction(ps)
+    if cur(ps) != 0:
+        discard(try es_fail(ps, "extraneous characters at the end"))
+    re.ncap = ps.capture_count
+    re.reg_depth = 0
+    try es_compile(re, root, &re.code, false)
+    discard(try re.code.push(Inst(op = OP_MATCH)))
+    re.nregs = es_register_count(re)
+    if re.nregs > REGISTER_COUNT_MAX:
+        discard(try es_fail(ps, "too many imbricated quantifiers"))
+    # named groups are present when some name is not empty
+    if re.group_names.used > (usize)((re.ncap - 1) * 2):
+        re.es_flags |= es_named_groups
+    re.caps = try heap_alloc[i32](&re.heap, (usize)(2 * re.ncap + re.nregs))
+    var i: usize = 0
+    while i < re.caps.length:
+        re.caps[i] = -1
+        i += 1
+    try es_compute_first(re)
+    re.nodes.free_all()
+
+## Release a program from `compile_ecmascript`.
+pub func free_ecmascript(re: Regex*):
+    regex_dispose(re)
+    let heap = re.heap
+    let rf = heap.realloc_func else trap("free_ecmascript: not an ECMAScript program")
+    discard(rf(heap.opaque, re, 0))
+
+# mark: Describing =============================================================================
+
+## The number of capture groups, including group 0 (the whole match): `captures` of exec
+## needs twice as many elements.
+pub func capture_count(re: const Regex*) -> i32:
+    return re.ncap
+
+## The flags the program was compiled with, plus es_named_groups when it has named groups.
+pub func program_flags(re: const Regex*) -> i32:
+    return re.es_flags
+
+## The group names, or none when the program has no named group: for each group after
+## group 0, its UTF-8 name followed by a NUL and one more byte (QuickJS's layout; an unnamed
+## group is two NULs).
+pub func group_names(re: const Regex*) -> const u8[]?:
+    if (re.es_flags & es_named_groups) == 0:
+        return none
+    return re.group_names.data[..<re.group_names.used]
+
+func es_group_of(re: const Regex*, name: str) -> i32:
+    let names = re.group_names.data[..<re.group_names.used]
+    var p: usize = 0
+    var index: i32 = 1
+    while p < names.length:
+        var len: usize = 0
+        while names[p + len] != 0:
+            len += 1
+        if len > 0 and same_name(names[p..<p + len], name.bytes):
+            return index
+        p += len + 2
+        index += 1
+    return -1
+
+# mark: Matching ===============================================================================
+
+## Match `subject`, a Latin-1 string, from code unit `start`. See the module notes for the
+## answer and `captures` (at least 2 * capture_count(re) elements).
+pub func exec8(re: Regex*, subject: const u8[], start: i32, captures: i32[], host: const Host*?) -> i32:
+    let src = Latin1(data = subject)
+    return es_exec(re, &src, start, captures, host)
+
+## Match `subject`, a UTF-16 string, from code unit `start`.
+pub func exec16(re: Regex*, subject: const u16[], start: i32, captures: i32[], host: const Host*?) -> i32:
+    if re.unicode:
+        let pairs = Utf16Pairs(data = subject)
+        return es_exec(re, &pairs, start, captures, host)
+    let units = Utf16(data = subject)
+    return es_exec(re, &units, start, captures, host)
+
+func es_exec[S: Units](re: Regex*, src: const S*, start: i32, captures: i32[], host: const Host*?) -> i32:
+    if not re.es:
+        trap("exec: not an ECMAScript program")
+    let ncap2 = (usize)(2 * re.ncap)
+    if captures.length < ncap2:
+        trap("exec: the captures array is too short")
+    var k: usize = 0
+    while k < ncap2:
+        captures[k] = -1
+        k += 1
+    re.len = src.count()
+    re.check_timeout = none
+    re.host_opaque = none
+    if let h = host:
+        re.check_timeout = h.check_timeout
+        re.host_opaque = h.opaque
+    re.budget = 10000
+    re.steps = 0
+    var at = start
+    if at < 0 or at > re.len:
+        return exec_no_match
+    # with u or v, a start inside a surrogate pair starts at the pair
+    if at > 0 and at < re.len and src.next(at - 1) > 0xFFFF:
+        at -= 1
+    let sticky = (re.es_flags & es_sticky) != 0
+    let code = re.code.data[..<re.code.used]
+    while true:
+        if not sticky and not re.first_any:
+            while at < re.len and not es_first_ok(re, src.next(at)):
+                at += src.width(src.next(at))
+            if at >= re.len:
+                return exec_no_match
+        var i: usize = 0
+        while i < ncap2:
+            re.caps[i] = -1
+            i += 1
+        let end = es_run(re, src, code, at, &re.stacks)
+        if end >= 0:
+            re.caps[0] = at
+            re.caps[1] = end
+            var j: usize = 0
+            while j < ncap2:
+                captures[j] = re.caps[j]
+                j += 1
+            return exec_match
+        if end == RUN_INTERRUPTED:
+            return exec_interrupted
+        if end == RUN_NO_MEMORY:
+            return exec_out_of_memory
+        if sticky or at >= re.len:
+            return exec_no_match
+        at += src.width(src.next(at))
+    return exec_no_match
+
+# mark: First-character filter =================================================================
+
+# The characters and classes a match must start with, when every path from the start reaches
+# a character test before anything else that could match (first_any otherwise).
+func es_compute_first(re: Regex*) -> !:
+    let plen = re.code.used
+    var seen = Vec[bool](heap = re.heap)
+    defer seen.free_all()
+    try seen.ensure(plen)
+    seen.used = plen
+    var i: usize = 0
+    while i < plen:
+        seen.data[i] = false
+        i += 1
+    var stack = Vec[i32](heap = re.heap)
+    defer stack.free_all()
+    discard(try stack.push(0))
+    while stack.used > 0:
+        let pc = stack.data[stack.used - 1]
+        stack.used -= 1
+        if seen.data[(usize)pc]:
+            continue
+        seen.data[(usize)pc] = true
+        let inst = re.code.data[(usize)pc]
+        let op = inst.op
+        if op == OP_SAVE or op == OP_ASSERT or op == OP_SET_REG or op == OP_SET_POS or op == OP_SAVE_RESET:
+            discard(try stack.push(pc + 1))
+        elif op == OP_JMP:
+            discard(try stack.push(inst.x))
+        elif op == OP_SPLIT:
+            discard(try stack.push(inst.x))
+            discard(try stack.push(inst.y))
+        elif op == OP_CHAR:
+            discard(try re.first_chars.push(inst.ch))
+        elif op == OP_CHAR_I:
+            discard(try re.first_chars_i.push(inst.ch))
+        elif op == OP_RANGE:
+            discard(try re.first_classes.push(inst.x))
+        elif op == OP_RANGE_I:
+            discard(try re.first_classes.push(-1 - inst.x))
+        else:
+            re.first_any = true
+            return
+
+func es_first_ok(re: const Regex*, c: u32) -> bool:
+    var i: usize = 0
+    while i < re.first_chars.used:
+        if re.first_chars.data[i] == c:
+            return true
+        i += 1
+    if re.first_chars_i.used > 0 or re.first_classes.used > 0:
+        let folded = canon(re, c)
+        var j: usize = 0
+        while j < re.first_chars_i.used:
+            if re.first_chars_i.data[j] == folded:
+                return true
+            j += 1
+        var k: usize = 0
+        while k < re.first_classes.used:
+            let ci = re.first_classes.data[k]
+            if ci >= 0:
+                if es_class_has(re, (usize)ci, c):
+                    return true
+            elif es_class_has(re, (usize)(-1 - ci), folded):
+                return true
+            k += 1
+    return false

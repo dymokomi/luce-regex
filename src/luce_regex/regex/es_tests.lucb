@@ -1,0 +1,257 @@
+#==============================================================================================
+#
+#   es_tests - Conformance tests of the ECMAScript dialect against QuickJS's libregexp
+#
+#   DESCRIPTION:
+#       Every expectation of the es_table_* fragments comes from upstream libregexp.c: the
+#       outcome of compiling a pattern (its error message, or its capture count, flags and
+#       group names), the result of an exec over an 8-bit or 16-bit subject from a start
+#       index, and parse_escape. A row's host mode selects the callbacks: 0 normal, 1
+#       check_timeout always true, 2 check_stack_overflow always true, 100 + N the allocator
+#       fails after N allocations (for an exec row, N allocations after the compile).
+#
+#==============================================================================================
+
+# mark: Table rows =============================================================================
+
+struct CompileCase:
+    let pattern: str
+    let flags: i32
+    let mode: i32
+    let expect: str
+
+struct ExecCase:
+    let pattern: str
+    let flags: i32
+    let mode: i32
+    # the code units; `%XXXX` is one unit in hex
+    let subject: str
+    let cbuf_type: i32
+    let cindex: i32
+    let expect: str
+
+struct EscapeCase:
+    let text: str
+    let allow_utf16: i32
+    let expect: str
+
+# mark: Hosts ==================================================================================
+
+var test_alloc_left: i32 = 0
+
+func test_limited_realloc(opaque: void*?, ptr: void*?, size: usize) -> void*?:
+    if size == 0:
+        unicode.c_free(ptr)
+        return none
+    if test_alloc_left <= 0:
+        return none
+    test_alloc_left -= 1
+    return unicode.c_realloc(ptr, size)
+
+func test_yes(opaque: void*?, size: usize) -> bool:
+    return true
+
+func test_timeout(opaque: void*?) -> bool:
+    return true
+
+func test_host(mode: i32) -> Host:
+    var host = Host()
+    if mode == 1:
+        host.check_timeout = test_timeout
+    elif mode == 2:
+        host.check_stack_overflow = test_yes
+    elif mode >= 100:
+        test_alloc_left = mode - 100
+        host.realloc_func = test_limited_realloc
+    return host
+
+# mark: Descriptions ===========================================================================
+
+# A growable text for the descriptions.
+struct Text:
+    var bytes: Vec[u8]
+
+    mutating func add(s: const u8[]):
+        for b in s:
+            discard(self.bytes.push(b) catch failure: trap("out of memory"))
+
+    mutating func add_int(v: i32):
+        var buf: u8[16]
+        let t = format(buf, f"{v}") catch failure:
+            recover "?"
+        self.add(t.bytes)
+
+    func view() -> str:
+        return (str)self.bytes.data[..<self.bytes.used]
+
+func put_hex(t: Text*, v: u32):
+    let chars = "0123456789abcdef".bytes
+    var digits: i32 = 1
+    while digits < 8 and (v >> (u32)(digits * 4)) != 0:
+        digits += 1
+    var i = digits - 1
+    while i >= 0:
+        let one = chars[(usize)((v >> (u32)(i * 4)) & 15)..<(usize)((v >> (u32)(i * 4)) & 15) + 1]
+        t.add(one)
+        i -= 1
+
+# "err=MSG" or "ok cc=N flags=0xN[ names=<a>,<b>]", as the C driver prints (less the bytecode).
+func describe_compile(t: Text*, re: Regex*?, message: const u8[]):
+    if re == none:
+        t.add("err=".bytes)
+        var n: usize = 0
+        while n < message.length and message[n] != 0:
+            n += 1
+        t.add(message[..<n])
+        return
+    let prog = re else trap("unreachable")
+    let cc = capture_count(prog)
+    t.add("ok cc=".bytes)
+    t.add_int(cc)
+    t.add(" flags=0x".bytes)
+    put_hex(t, (u32)program_flags(prog))
+    if let names = group_names(prog):
+        t.add(" names=".bytes)
+        var p: usize = 0
+        var i: i32 = 1
+        while i < cc:
+            if i != 1:
+                t.add(",".bytes)
+            var n: usize = 0
+            while names[p + n] != 0:
+                n += 1
+            t.add("<".bytes)
+            t.add(names[p..<p + n])
+            t.add(">".bytes)
+            p += n + 2
+            i += 1
+
+func hex_value(c: u8) -> u32:
+    if c >= '0' and c <= '9':
+        return (u32)(c - '0')
+    return (u32)(c - 'a') + 10
+
+# Decode a row's subject into code units.
+func decode_units(subject: str, out: Vec[u16]*):
+    let b = subject.bytes
+    var i: usize = 0
+    while i < b.length:
+        if b[i] == '%':
+            var v: u32 = 0
+            for k: usize in 1..=4:
+                v = (v << 4) | hex_value(b[i + k])
+            discard(out.push((u16)v) catch failure: trap("out of memory"))
+            i += 5
+        else:
+            discard(out.push((u16)b[i]) catch failure: trap("out of memory"))
+            i += 1
+
+# mark: Checks =================================================================================
+
+func check_compile(c: const CompileCase*) -> bool:
+    let host = test_host(c.mode)
+    var message: u8[64]
+    let re = compile_ecmascript(c.pattern.bytes, c.flags, message, &host)
+    var t = Text(bytes = Vec[u8]())
+    defer t.bytes.free_all()
+    describe_compile(&t, re, message)
+    var ok = t.view() == c.expect
+    # Known deviation: when building \d, \s or \w runs out of memory, libregexp fails
+    # without setting a message (cr_init_char_range); this engine says "out of memory".
+    if not ok and c.mode >= 100 and c.expect == "err=" and t.view() == "err=out of memory":
+        ok = true
+    if not ok:
+        print(f"compile /{c.pattern}/ {c.flags} mode {c.mode}:\n  got    {t.view()}\n  expect {c.expect}")
+    if let prog = re:
+        free_ecmascript(prog)
+    return ok
+
+func check_exec(c: const ExecCase*) -> bool:
+    # compile with an allocator that only starts counting for the exec
+    test_alloc_left = 1000000000
+    var compile_host = Host(realloc_func = test_limited_realloc)
+    var message: u8[64]
+    let re0 = compile_ecmascript(c.pattern.bytes, c.flags, message, &compile_host)
+    var t = Text(bytes = Vec[u8]())
+    defer t.bytes.free_all()
+    if re0 == none:
+        var n: usize = 0
+        while message[n] != 0:
+            n += 1
+        t.add("compile error ".bytes)
+        t.add(message[..<n])
+        if t.view() != c.expect:
+            print(f"exec /{c.pattern}/: got {t.view()}, expect {c.expect}")
+            return false
+        return true
+    let re = re0 else trap("unreachable")
+    defer free_ecmascript(re)
+    var units = Vec[u16]()
+    defer units.free_all()
+    decode_units(c.subject, &units)
+    var bytes = Vec[u8]()
+    defer bytes.free_all()
+    for u in units.data[..<units.used]:
+        discard(bytes.push((u8)u) catch failure: trap("out of memory"))
+    let cc = capture_count(re)
+    let captures = alloc i32[(usize)(2 * cc)] in memory.heap catch failure: trap("out of memory")
+    defer free(captures) in memory.heap
+    var host = test_host(c.mode)
+    if c.mode >= 100:
+        host.realloc_func = none
+    var ret: i32 = 0
+    if c.cbuf_type == 0:
+        ret = exec8(re, bytes.data[..<bytes.used], c.cindex, captures, &host)
+    else:
+        ret = exec16(re, units.data[..<units.used], c.cindex, captures, &host)
+    t.add_int(ret)
+    if ret == 1:
+        for i: i32 in 0..<cc:
+            let a = captures[(usize)(2 * i)]
+            let z = captures[(usize)(2 * i + 1)]
+            if a >= 0 and z >= 0:
+                t.add(" ".bytes)
+                t.add_int(a)
+                t.add(",".bytes)
+                t.add_int(z)
+            else:
+                t.add(" -".bytes)
+    let ok = t.view() == c.expect
+    if not ok:
+        print(f"exec /{c.pattern}/ {c.flags} mode {c.mode} on \"{c.subject}\" type {c.cbuf_type} at {c.cindex}:\n  got    {t.view()}\n  expect {c.expect}")
+    return ok
+
+# mark: Tests ==================================================================================
+
+test "ECMAScript compile: capture counts, flags, group names and error messages":
+    var failures: i32 = 0
+    for c in &es_compile_cases:
+        if not check_compile(c):
+            failures += 1
+    print(f"compile rows: {es_compile_cases.length - (usize)failures} of {es_compile_cases.length} pass")
+    assert(failures == 0)
+
+test "ECMAScript exec: captures over 8-bit and 16-bit subjects":
+    var failures: i32 = 0
+    for c in &es_exec_cases1:
+        if not check_exec(c):
+            failures += 1
+    for c in &es_exec_cases2:
+        if not check_exec(c):
+            failures += 1
+    let total = es_exec_cases1.length + es_exec_cases2.length
+    print(f"exec rows: {total - (usize)failures} of {total} pass")
+    assert(failures == 0)
+
+test "parse_escape":
+    var failures: i32 = 0
+    for c in &es_escape_cases:
+        var pos: usize = 0
+        let ret = parse_escape(c.text.bytes, &pos, c.allow_utf16)
+        var buf: u8[32]
+        let got = format(buf, f"{ret} {pos}") catch failure:
+            recover "?"
+        if got != c.expect:
+            print(f"escape \"{c.text}\" {c.allow_utf16}: got {got}, expect {c.expect}")
+            failures += 1
+    assert(failures == 0)

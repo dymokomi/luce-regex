@@ -1,0 +1,271 @@
+#==============================================================================================
+#
+#   es_compile - The ECMAScript compiler: AST to instructions
+#
+#   DESCRIPTION:
+#       Compiles the AST of es_parse.lucb the way libregexp.c emits bytecode as it parses.
+#       Inside a lookbehind the body is compiled backward, as in QuickJS: the terms of a
+#       concatenation are reversed, a character test is wrapped in PREV ... PREV (step back,
+#       test forward, step back again), a group saves its end before its start and a
+#       backreference compares backward.
+#
+#       A quantifier gets QuickJS's loop layout (re_parse_term's quantifier section): a
+#       SPLIT loop for ?, * and +, or a counter register for counted repeats; the captures of
+#       the atom are reset at each iteration (SAVE_RESET) unless the atom always sets them;
+#       and an optional iteration must advance (the ES empty check) unless the atom always
+#       consumes a character. Registers are allocated as a stack, one level per nested loop.
+#
+#==============================================================================================
+
+# mark: Emission ===============================================================================
+
+func emit(out: Vec[Inst]*, op: u8, x: i32, y: i32) -> usize!:
+    var inst = Inst(op = op)
+    inst.x = x
+    inst.y = y
+    return try out.push(inst)
+
+func es_char_op(out: Vec[Inst]*, op: u8, x: i32, ch: u32, backward: bool) -> !:
+    if backward:
+        discard(try emit(out, OP_PREV, 0, 0))
+    var inst = Inst(op = op)
+    inst.x = x
+    inst.ch = ch
+    discard(try out.push(inst))
+    if backward:
+        discard(try emit(out, OP_PREV, 0, 0))
+
+func es_compile(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
+    let node = re.nodes.data[(usize)ni]
+    let kind = node.kind
+    let ic = (node.flags & F_IC) != 0
+    if kind == K_CHAR:
+        try es_char_op(out, OP_CHAR_I if ic else OP_CHAR, 0, node.ch, backward)
+    elif kind == K_ANY:
+        try es_char_op(out, OP_ANY_ALL if (node.flags & F_DOTALL) != 0 else OP_DOT, 0, 0, backward)
+    elif kind == K_CLASS:
+        try es_char_op(out, OP_RANGE_I if ic else OP_RANGE, node.a, 0, backward)
+    elif kind == K_ANCHOR:
+        discard(try emit(out, OP_ASSERT, node.a, 0))
+    elif kind == K_CONCAT:
+        if not backward:
+            var child = node.first_child
+            while child != -1:
+                try es_compile(re, child, out, backward)
+                child = re.nodes.data[(usize)child].next_sibling
+        else:
+            # the terms in reverse order
+            var children = Vec[i32](heap = re.heap)
+            defer children.free_all()
+            var child = node.first_child
+            while child != -1:
+                discard(try children.push(child))
+                child = re.nodes.data[(usize)child].next_sibling
+            var k = children.used
+            while k > 0:
+                k -= 1
+                try es_compile(re, children.data[k], out, backward)
+    elif kind == K_ALT:
+        try es_compile_alt(re, ni, out, backward)
+    elif kind == K_GROUP:
+        if node.a == 0:
+            try es_compile(re, node.first_child, out, backward)
+        else:
+            let first = 2 * node.a + (1 if backward else 0)
+            let second = 2 * node.a + (0 if backward else 1)
+            discard(try emit(out, OP_SAVE, first, 0))
+            try es_compile(re, node.first_child, out, backward)
+            discard(try emit(out, OP_SAVE, second, 0))
+    elif kind == K_REPEAT:
+        try es_compile_repeat(re, ni, out, backward)
+    elif kind == K_BACKREF:
+        var inst = Inst(op = OP_BACKREF_ES)
+        inst.x = node.x
+        inst.y = node.y
+        inst.ch = (1 if ic else 0) | (2 if backward else 0)
+        discard(try out.push(inst))
+    elif kind == K_LOOK:
+        let start = try emit(out, OP_LOOK_START, 0, 0)
+        out.data[start].negate = node.negate
+        try es_compile(re, node.first_child, out, not node.ahead)
+        discard(try emit(out, OP_NLOOK_MATCH if node.negate else OP_LOOK_MATCH, 0, 0))
+        out.data[start].x = (i32)out.used
+    # K_EMPTY emits nothing.
+
+func es_compile_alt(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
+    let node = re.nodes.data[(usize)ni]
+    var jumps = Vec[i32](heap = re.heap)
+    defer jumps.free_all()
+    var child = node.first_child
+    while child != -1:
+        let nxt = re.nodes.data[(usize)child].next_sibling
+        if nxt != -1:
+            let si = try emit(out, OP_SPLIT, 0, 0)
+            out.data[si].x = (i32)out.used
+            try es_compile(re, child, out, backward)
+            let ji = try emit(out, OP_JMP, 0, 0)
+            discard(try jumps.push((i32)ji))
+            out.data[si].y = (i32)out.used
+        else:
+            try es_compile(re, child, out, backward)
+        child = nxt
+    let end = (i32)out.used
+    var k: usize = 0
+    while k < jumps.used:
+        out.data[(usize)jumps.data[k]].x = end
+        k += 1
+
+# mark: Quantifiers ============================================================================
+
+func is_reg_op(op: u8) -> bool:
+    return op == OP_SET_REG or op == OP_SET_POS or op == OP_CHECK_ADV or op == OP_LOOP or op == OP_LOOP_SPLIT
+
+# Append `body` to `out`, moving its jump targets by where it lands and its registers by
+# `reg_delta`.
+func append_code(out: Vec[Inst]*, body: const Vec[Inst]*, reg_delta: i32) -> !:
+    let off = (i32)out.used
+    var i: usize = 0
+    while i < body.used:
+        var inst = body.data[i]
+        let op = inst.op
+        if op == OP_JMP or op == OP_LOOK_START:
+            inst.x += off
+        elif op == OP_SPLIT:
+            inst.x += off
+            inst.y += off
+        elif op == OP_LOOP or op == OP_LOOP_SPLIT:
+            inst.y += off
+        if is_reg_op(op):
+            inst.x += reg_delta
+        discard(try out.push(inst))
+        i += 1
+
+# re_need_check_adv_and_capture_init: whether an iteration of the atom may match nothing
+# (false when a character test comes before any control flow), and whether its captures
+# must be reset at each iteration (true unless the atom sets them all unconditionally).
+func atom_analysis(body: const Vec[Inst]*) -> (bool, bool):
+    var need_check_adv = true
+    var need_capture_init = false
+    var i: usize = 0
+    while i < body.used:
+        let op = body.data[i].op
+        if op == OP_CHAR or op == OP_CHAR_I or op == OP_DOT or op == OP_ANY_ALL or op == OP_RANGE or op == OP_RANGE_I:
+            need_check_adv = false
+        elif op == OP_ASSERT or op == OP_SET_REG or op == OP_SET_POS or op == OP_PREV or op == OP_SAVE or op == OP_SAVE_RESET:
+            # no effect
+            need_check_adv = need_check_adv
+        elif op == OP_BACKREF_ES:
+            need_capture_init = true
+        else:
+            # safe behavior: we cannot predict the outcome
+            need_capture_init = true
+            break
+        i += 1
+    return (need_check_adv, need_capture_init)
+
+func es_compile_repeat(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
+    let node = re.nodes.data[(usize)ni]
+    let quant_min = node.a
+    let quant_max = node.b
+    let greedy = node.greedy
+    let has_caps = node.y > node.x
+    # the atom, compiled with room for this level's two registers below its own
+    let base = re.reg_depth
+    var body = Vec[Inst](heap = re.heap)
+    defer body.free_all()
+    re.reg_depth = base + 2
+    try es_compile(re, node.first_child, &body, backward)
+    re.reg_depth = base
+    let analysis = atom_analysis(&body)
+    var check = analysis.0
+    let need_capture_init = analysis.1
+    let reset_inside = need_capture_init and has_caps
+    let reg0 = 2 * re.ncap + base
+
+    if quant_min == 0:
+        # reset the captures once in case the atom is not executed
+        if not need_capture_init and has_caps:
+            discard(try emit(out, OP_SAVE_RESET, node.x, node.y - 1))
+        if quant_max == 0:
+            return
+        if quant_max == 1 or quant_max == INT32_MAX:
+            let split_at = try emit(out, OP_SPLIT, 0, 0)
+            let body_start = (i32)out.used
+            if check:
+                discard(try emit(out, OP_SET_POS, reg0, 0))
+            if reset_inside:
+                discard(try emit(out, OP_SAVE_RESET, node.x, node.y - 1))
+            try append_code(out, &body, (1 if check else 0) - 2)
+            if check:
+                discard(try emit(out, OP_CHECK_ADV, reg0, 0))
+            if quant_max == INT32_MAX:
+                discard(try emit(out, OP_JMP, (i32)split_at, 0))
+            try patch_split(out, split_at, body_start, (i32)out.used, greedy)
+        else:
+            let split_at = try emit(out, OP_SPLIT, 0, 0)
+            let next = (i32)out.used
+            discard(try emit(out, OP_SET_REG, reg0, quant_max))
+            let loop_top = try emit_counted_body(out, &body, reg0, check, reset_inside, node)
+            try emit_loop_split(out, reg0, loop_top, quant_max, greedy, check)
+            try patch_split(out, split_at, next, (i32)out.used, greedy)
+    elif quant_min == 1 and quant_max == INT32_MAX and not check:
+        let top = (i32)out.used
+        if reset_inside:
+            discard(try emit(out, OP_SAVE_RESET, node.x, node.y - 1))
+        try append_code(out, &body, -2)
+        let split_at = try emit(out, OP_SPLIT, 0, 0)
+        try patch_split(out, split_at, top, (i32)out.used, greedy)
+    else:
+        if quant_min == quant_max:
+            check = false
+        discard(try emit(out, OP_SET_REG, reg0, quant_max))
+        let loop_top = try emit_counted_body(out, &body, reg0, check, reset_inside, node)
+        if quant_min == quant_max:
+            # a simple loop is enough
+            discard(try emit(out, OP_LOOP, reg0, loop_top))
+        else:
+            try emit_loop_split(out, reg0, loop_top, quant_max - quant_min, greedy, check)
+
+# The body of a counted loop (counter in `reg0`, start position in `reg0 + 1` when
+# checking); answers the loop's top.
+func emit_counted_body(out: Vec[Inst]*, body: const Vec[Inst]*, reg0: i32, check: bool,
+                       reset_inside: bool, node: Node) -> i32!:
+    let loop_top = (i32)out.used
+    if check:
+        discard(try emit(out, OP_SET_POS, reg0 + 1, 0))
+    if reset_inside:
+        discard(try emit(out, OP_SAVE_RESET, node.x, node.y - 1))
+    try append_code(out, body, (2 if check else 1) - 2)
+    return loop_top
+
+# The LOOP_SPLIT closing a counted body.
+func emit_loop_split(out: Vec[Inst]*, reg0: i32, loop_top: i32, limit: i32, greedy: bool, check: bool) -> !:
+    let li = try emit(out, OP_LOOP_SPLIT, reg0, loop_top)
+    out.data[li].ch = (u32)limit
+    out.data[li].ahead = greedy
+    out.data[li].negate = check
+
+# A SPLIT preferring `body` when greedy, `exit` otherwise.
+func patch_split(out: Vec[Inst]*, split_at: usize, body: i32, exit: i32, greedy: bool) -> !:
+    if greedy:
+        out.data[split_at].x = body
+        out.data[split_at].y = exit
+    else:
+        out.data[split_at].x = exit
+        out.data[split_at].y = body
+
+# The number of registers the program uses (compute_register_count).
+func es_register_count(re: const Regex*) -> i32:
+    var top: i32 = 0
+    let first = 2 * re.ncap
+    var i: usize = 0
+    while i < re.code.used:
+        let inst = re.code.data[i]
+        if is_reg_op(inst.op):
+            var used = inst.x - first + 1
+            if inst.op == OP_LOOP_SPLIT and inst.negate:
+                used += 1
+            if used > top:
+                top = used
+        i += 1
+    return top

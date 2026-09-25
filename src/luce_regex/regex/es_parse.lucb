@@ -1,0 +1,419 @@
+#==============================================================================================
+#
+#   es_parse - The ECMAScript front end: pattern bytes to AST
+#
+#   DESCRIPTION:
+#       Port of libregexp.c's re_parse_term, re_parse_alternative and re_parse_disjunction
+#       (lines 1845-2440). Where the C parser emits bytecode as it goes, this one builds the
+#       engine's AST; the direction of matching (forward, or backward inside a lookbehind),
+#       the loop layout of a quantifier and the capture resets are decided when the AST is
+#       compiled (es_compile.lucb). The syntax accepted, the errors and their messages are
+#       QuickJS's, including the Annex B extensions allowed without the u or v flag.
+#
+#==============================================================================================
+
+# mark: Nodes ==================================================================================
+
+func es_flags(ps: const EsParse*) -> u8:
+    var f: u8 = 0
+    if ps.ignore_case:
+        f |= F_IC
+    if ps.dotall:
+        f |= F_DOTALL
+    if ps.multi_line:
+        f |= F_MULTI
+    return f
+
+func es_node(ps: EsParse*, kind: u8) -> i32!:
+    let n = try new_node(ps.re, kind)
+    ps.re.nodes.data[(usize)n].flags = es_flags(ps)
+    return n
+
+func es_parent(ps: EsParse*, kind: u8, child: i32) -> i32!:
+    let n = try es_node(ps, kind)
+    ps.re.nodes.data[(usize)n].first_child = child
+    return n
+
+# A backreference to the groups `list`.
+func es_backref(ps: EsParse*, list: const Vec[i32]*) -> i32!:
+    let re = ps.re
+    let n = try es_node(ps, K_BACKREF)
+    re.nodes.data[(usize)n].x = (i32)re.ref_lists.used
+    re.nodes.data[(usize)n].y = (i32)list.used
+    var i: usize = 0
+    while i < list.used:
+        discard(try re.ref_lists.push(list.data[i]))
+        i += 1
+    return n
+
+# A class atom that is a set (C's CLASS_RANGE_BASE answer), as a node.
+func es_set_atom(ps: EsParse*, s: StrSet*, c: i32) -> i32!:
+    defer set_free(s)
+    let n = try set_to_node(ps, s)
+    # the common 'space' tests: C emits REOP_space / REOP_not_space, which ignore the i flag
+    if c == CLASS_RANGE_BASE + (i32)CLASS_s or c == CLASS_RANGE_BASE + (i32)CLASS_S:
+        ps.re.nodes.data[(usize)n].flags = 0
+    return n
+
+func es_char_atom(ps: EsParse*, c0: u32) -> i32!:
+    var c = c0
+    if ps.ignore_case:
+        c = (u32)unicode.lre_canonicalize(c, ps.is_unicode)
+    let n = try es_node(ps, K_CHAR)
+    ps.re.nodes.data[(usize)n].ch = c
+    return n
+
+# mark: Disjunctions ===========================================================================
+
+func es_parse_disjunction(ps: EsParse*) -> i32!:
+    try es_check_stack(ps)
+    let first = try es_parse_alternative(ps)
+    if cur(ps) != '|':
+        return first
+    var head = first
+    var tail = first
+    while cur(ps) == '|':
+        ps.p += 1
+        ps.group_name_scope +%= 1
+        let alt = try es_parse_alternative(ps)
+        try link_sibling(ps.re, &head, &tail, alt)
+    return try es_parent(ps, K_ALT, head)
+
+func es_parse_alternative(ps: EsParse*) -> i32!:
+    var head: i32 = -1
+    var tail: i32 = -1
+    while true:
+        if ps.p >= ps.src.length:
+            break
+        let c = cur(ps)
+        if c == '|' or c == ')':
+            break
+        let term = try es_parse_term(ps)
+        try link_sibling(ps.re, &head, &tail, term)
+    if head < 0:
+        return try es_node(ps, K_EMPTY)
+    if head == tail:
+        return head
+    return try es_parent(ps, K_CONCAT, head)
+
+# mark: Terms ==================================================================================
+
+func es_parse_term(ps: EsParse*) -> i32!:
+    let re = ps.re
+    var atom: i32 = -1            # a quantifiable atom (C's last_atom_start >= 0)
+    var last_capture_count: i32 = 0
+    var class_atom = false        # C's goto parse_class_atom
+    var char_value: i32 = -1      # C's goto normal_char with c
+    let c = cur(ps)
+    if c == '^':
+        ps.p += 1
+        return try mk_anchor(re, AN_ES_BOL_M if ps.multi_line else AN_ES_BOL)
+    elif c == '$':
+        ps.p += 1
+        return try mk_anchor(re, AN_ES_EOL_M if ps.multi_line else AN_ES_EOL)
+    elif c == '.':
+        ps.p += 1
+        last_capture_count = ps.capture_count
+        atom = try es_node(ps, K_ANY)
+    elif c == '{':
+        if ps.is_unicode:
+            return try es_fail(ps, "syntax error")
+        elif not is_ascii_digit(ch_at(ps, ps.p + 1)):
+            # Annex B: we accept '{' not followed by digits as a normal atom
+            class_atom = true
+        else:
+            var p1 = ps.p + 1
+            # Annex B: error if it is like a repetition count
+            discard(parse_digits(ps, &p1, true))
+            if ch_at(ps, p1) == ',':
+                p1 += 1
+                if is_ascii_digit(ch_at(ps, p1)):
+                    discard(parse_digits(ps, &p1, true))
+            if ch_at(ps, p1) != '}':
+                class_atom = true
+            else:
+                return try es_fail(ps, "nothing to repeat")
+    elif c == '*' or c == '+' or c == '?':
+        return try es_fail(ps, "nothing to repeat")
+    elif c == '(':
+        let quantifiable = try es_parse_paren(ps, &last_capture_count)
+        if quantifiable.1:
+            atom = quantifiable.0
+        else:
+            return quantifiable.0
+    elif c == '\\':
+        let c1 = ch_at(ps, ps.p + 1)
+        if c1 == 'b' or c1 == 'B':
+            let i_variant = ps.ignore_case and ps.is_unicode
+            var kind = AN_ES_WB_I if i_variant else AN_ES_WB
+            if c1 == 'B':
+                kind = AN_ES_NWB_I if i_variant else AN_ES_NWB
+            ps.p += 2
+            return try mk_anchor(re, kind)
+        elif c1 == 'k':
+            let backref = try es_parse_named_backref(ps)
+            if backref >= 0:
+                last_capture_count = ps.capture_count
+                atom = backref
+            else:
+                class_atom = true
+        elif c1 == '0':
+            ps.p += 2
+            var v: i32 = 0
+            if ps.is_unicode:
+                if is_ascii_digit(cur(ps)):
+                    return try es_fail(ps, "invalid decimal escape in regular expression")
+            else:
+                # Annex B.1.4: accept legacy octal
+                if cur(ps) >= '0' and cur(ps) <= '7':
+                    v = (i32)(cur(ps) - '0')
+                    ps.p += 1
+                    if cur(ps) >= '0' and cur(ps) <= '7':
+                        v = (v << 3) + (i32)(cur(ps) - '0')
+                        ps.p += 1
+            char_value = v
+        elif c1 >= '1' and c1 <= '9':
+            ps.p += 1
+            let q = ps.p
+            var pp = ps.p
+            var v = parse_digits(ps, &pp, false)
+            ps.p = pp
+            if v < 0 or (v >= ps.capture_count and v >= try count_captures(ps)):
+                if ps.is_unicode:
+                    return try es_fail(ps, "back reference out of range in regular expression")
+                # Annex B.1.4: accept legacy octal
+                ps.p = q
+                if cur(ps) <= '7':
+                    v = 0
+                    if cur(ps) <= '3':
+                        v = (i32)(cur(ps) - '0')
+                        ps.p += 1
+                    if cur(ps) >= '0' and cur(ps) <= '7':
+                        v = (v << 3) + (i32)(cur(ps) - '0')
+                        ps.p += 1
+                        if cur(ps) >= '0' and cur(ps) <= '7':
+                            v = (v << 3) + (i32)(cur(ps) - '0')
+                            ps.p += 1
+                else:
+                    v = (i32)cur(ps)
+                    ps.p += 1
+                char_value = v
+            else:
+                last_capture_count = ps.capture_count
+                var list = Vec[i32](heap = re.heap)
+                defer list.free_all()
+                discard(try list.push(v))
+                atom = try es_backref(ps, &list)
+        else:
+            class_atom = true
+    elif c == '[':
+        last_capture_count = ps.capture_count
+        var s: StrSet = ---
+        try parse_nested_class(ps, &s)
+        atom = try es_set_atom(ps, &s, CLASS_RANGE_BASE)
+    elif c == ']' or c == '}':
+        if ps.is_unicode:
+            return try es_fail(ps, "syntax error")
+        class_atom = true
+    else:
+        class_atom = true
+
+    if class_atom:
+        var s: StrSet = ---
+        let v = try get_class_atom(ps, &s, false)
+        last_capture_count = ps.capture_count
+        if v >= CLASS_RANGE_BASE:
+            atom = try es_set_atom(ps, &s, v)
+        else:
+            char_value = v
+    if char_value >= 0:
+        last_capture_count = ps.capture_count
+        atom = try es_char_atom(ps, (u32)char_value)
+    return try es_parse_quantifier(ps, atom, last_capture_count)
+
+# A parenthesised term at '(': the node and whether a quantifier may follow it.
+func es_parse_paren(ps: EsParse*, last_capture_count: i32*) -> (i32, bool)!:
+    let re = ps.re
+    if ch_at(ps, ps.p + 1) != '?':
+        ps.p += 1
+        # capture without group name
+        discard(try re.group_names.push(0))
+        discard(try re.group_names.push(0))
+        return (try es_parse_capture(ps, last_capture_count), true)
+    let c2 = ch_at(ps, ps.p + 2)
+    if c2 == ':':
+        ps.p += 3
+        *last_capture_count = ps.capture_count
+        let inner = try es_parse_disjunction(ps)
+        try es_expect(ps, ')')
+        return (inner, true)
+    if c2 == 'i' or c2 == 'm' or c2 == 's' or c2 == '-':
+        ps.p += 2
+        var remove_mask: i32 = 0
+        let add_mask = try parse_modifiers(ps)
+        if cur(ps) == '-':
+            ps.p += 1
+            remove_mask = try parse_modifiers(ps)
+        if (add_mask == 0 and remove_mask == 0) or (add_mask & remove_mask) != 0:
+            discard(try es_fail(ps, "invalid modifiers"))
+        try es_expect(ps, ':')
+        let saved_ignore_case = ps.ignore_case
+        let saved_multi_line = ps.multi_line
+        let saved_dotall = ps.dotall
+        ps.ignore_case = update_modifier(ps.ignore_case, add_mask, remove_mask, es_ignore_case)
+        ps.multi_line = update_modifier(ps.multi_line, add_mask, remove_mask, es_multiline)
+        ps.dotall = update_modifier(ps.dotall, add_mask, remove_mask, es_dotall)
+        *last_capture_count = ps.capture_count
+        let inner = try es_parse_disjunction(ps)
+        try es_expect(ps, ')')
+        ps.ignore_case = saved_ignore_case
+        ps.multi_line = saved_multi_line
+        ps.dotall = saved_dotall
+        return (inner, true)
+    var is_neg = false
+    var is_backward = false
+    if c2 == '=' or c2 == '!':
+        is_neg = c2 == '!'
+        ps.p += 3
+    elif c2 == '<' and (ch_at(ps, ps.p + 3) == '=' or ch_at(ps, ps.p + 3) == '!'):
+        is_neg = ch_at(ps, ps.p + 3) == '!'
+        is_backward = true
+        ps.p += 4
+    elif c2 == '<':
+        ps.p += 3
+        var p = ps.p
+        if not parse_group_name(ps, ps.name, &ps.name_len, &p):
+            discard(try es_fail(ps, "invalid group name"))
+        ps.p = p
+        let name = ps.name[0..<ps.name_len]
+        # poor's man method to test duplicate group names.
+        # XXX: this method does not catch all the errors
+        if is_duplicate_group_name(ps, name, ps.group_name_scope):
+            discard(try es_fail(ps, "duplicate group name"))
+        # group name with a trailing zero
+        for b in name:
+            discard(try re.group_names.push(b))
+        discard(try re.group_names.push(0))
+        discard(try re.group_names.push(ps.group_name_scope))
+        ps.has_named_captures = 1
+        return (try es_parse_capture(ps, last_capture_count), true)
+    else:
+        discard(try es_fail(ps, "invalid group"))
+    # a lookaround. Annex B allows a lookahead to be used as an atom for the quantifiers.
+    let quantifiable = not ps.is_unicode and not is_backward
+    if quantifiable:
+        *last_capture_count = ps.capture_count
+    let inner = try es_parse_disjunction(ps)
+    try es_expect(ps, ')')
+    let n = try es_parent(ps, K_LOOK, inner)
+    re.nodes.data[(usize)n].ahead = not is_backward
+    re.nodes.data[(usize)n].negate = is_neg
+    return (n, quantifiable)
+
+# The body of a capture group, with `ps.p` after its opening.
+func es_parse_capture(ps: EsParse*, last_capture_count: i32*) -> i32!:
+    if ps.capture_count >= CAPTURE_COUNT_MAX:
+        return try es_fail(ps, "too many captures")
+    *last_capture_count = ps.capture_count
+    let capture_index = ps.capture_count
+    ps.capture_count += 1
+    let inner = try es_parse_disjunction(ps)
+    try es_expect(ps, ')')
+    let n = try es_parent(ps, K_GROUP, inner)
+    ps.re.nodes.data[(usize)n].a = capture_index
+    return n
+
+# \k<name> at `ps.p`: the backreference node, or -1 when Annex B makes it the atom 'k'.
+func es_parse_named_backref(ps: EsParse*) -> i32!:
+    var p1 = ps.p
+    if ch_at(ps, p1 + 2) != '<':
+        # annex B: we tolerate invalid group names in non unicode mode if there is no named
+        # capture definition
+        if ps.is_unicode or try has_named_captures(ps):
+            discard(try es_fail(ps, "expecting group name"))
+        return -1
+    p1 += 3
+    if not parse_group_name(ps, ps.name, &ps.name_len, &p1):
+        if ps.is_unicode or try has_named_captures(ps):
+            discard(try es_fail(ps, "invalid group name"))
+        return -1
+    let name = ps.name[0..<ps.name_len]
+    var list = Vec[i32](heap = ps.re.heap)
+    defer list.free_all()
+    var n = try find_group_name(ps, name, &list)
+    if n == 0:
+        # no capture name parsed before, try to look after (inefficient, but hopefully not
+        # common)
+        var dummy: i32 = 0
+        n = try parse_captures(ps, &dummy, name, &list)
+        if n == 0:
+            if ps.is_unicode or try has_named_captures(ps):
+                discard(try es_fail(ps, "group name not defined"))
+            return -1
+    ps.p = p1
+    # a backreference to all the captures matching the group name
+    return try es_backref(ps, &list)
+
+# mark: Quantifiers ============================================================================
+
+# The quantifier after `atom`, if any (none may follow when `atom` is -1).
+func es_parse_quantifier(ps: EsParse*, atom: i32, last_capture_count: i32) -> i32!:
+    if atom < 0:
+        trap("es_parse_quantifier: no atom")
+    var quant_min: i32 = 0
+    var quant_max: i32 = 0
+    let c = cur(ps)
+    if c == '*':
+        ps.p += 1
+        quant_min = 0
+        quant_max = INT32_MAX
+    elif c == '+':
+        ps.p += 1
+        quant_min = 1
+        quant_max = INT32_MAX
+    elif c == '?':
+        ps.p += 1
+        quant_min = 0
+        quant_max = 1
+    elif c == '{':
+        let p1 = ps.p
+        # As an extension (see ES6 annex B), we accept '{' not followed by digits as a
+        # normal atom
+        if not is_ascii_digit(ch_at(ps, ps.p + 1)):
+            if ps.is_unicode:
+                return try es_fail(ps, "invalid repetition count")
+            return atom
+        ps.p += 1
+        var pp = ps.p
+        quant_min = parse_digits(ps, &pp, true)
+        ps.p = pp
+        quant_max = quant_min
+        if cur(ps) == ',':
+            ps.p += 1
+            if is_ascii_digit(cur(ps)):
+                pp = ps.p
+                quant_max = parse_digits(ps, &pp, true)
+                ps.p = pp
+                if quant_max < quant_min:
+                    return try es_fail(ps, "invalid repetition count")
+            else:
+                quant_max = INT32_MAX # infinity
+        if cur(ps) != '}' and not ps.is_unicode:
+            # Annex B: normal atom if invalid '{' syntax
+            ps.p = p1
+            return atom
+        try es_expect(ps, '}')
+    else:
+        return atom
+    var greedy = true
+    if cur(ps) == '?':
+        ps.p += 1
+        greedy = false
+    let re = ps.re
+    let n = try es_parent(ps, K_REPEAT, atom)
+    re.nodes.data[(usize)n].a = quant_min
+    re.nodes.data[(usize)n].b = quant_max
+    re.nodes.data[(usize)n].greedy = greedy
+    re.nodes.data[(usize)n].x = last_capture_count
+    re.nodes.data[(usize)n].y = ps.capture_count
+    return n

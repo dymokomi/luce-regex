@@ -1,0 +1,199 @@
+#==============================================================================================
+#
+#   module - The regex engine: constants, the growable vector and the allocation hook
+#
+#   DESCRIPTION:
+#       A from-scratch regular-expression engine with two dialects over one core. A pattern
+#       is parsed by a dialect front end to an AST (a pool of index-linked nodes), compiled
+#       once to a flat array of instructions, and matched by an ITERATIVE backtracking VM
+#       (Cox / RE2 / Go design). The hot loop is integer comparisons and allocates nothing
+#       per step once its stacks are warm.
+#
+#       The Oniguruma dialect (`Regex.init`, `compile`) covers the subset TextMate grammars
+#       use and matches over Unicode code points (u32); positions are code point indices,
+#       as the editor counts offsets. A step budget bounds pathological patterns.
+#
+#       The ECMAScript dialect (`compile_ecmascript`, `exec8`, `exec16`; es_api.lucb) is
+#       ES2025 RegExp with QuickJS's exact syntax, errors and match results: it matches
+#       over UTF-16 code units (8-bit Latin-1 or 16-bit buffers), with surrogate pairs as
+#       one code point in u/v mode, and it is what luce-js uses for RegExp.
+#
+#       The VM is generic over the subject (`Units`, units.lucb): each dialect and buffer
+#       width gets its own monomorphised copy, so the code point loop of the TextMate path
+#       pays nothing for the others.
+#
+#==============================================================================================
+
+import memory
+import utf8
+import interop
+import luce_regex.unicode as unicode
+
+## A pattern the engine could not parse.
+pub let syntax_error: ErrorCode = ErrorCode.package(330)
+
+# mark: AST node kinds =========================================================================
+
+let K_EMPTY: u8 = 0
+let K_CHAR: u8 = 1
+let K_ANY: u8 = 2
+let K_CLASS: u8 = 3
+let K_ANCHOR: u8 = 4
+let K_CONCAT: u8 = 5
+let K_ALT: u8 = 6
+let K_REPEAT: u8 = 7
+let K_GROUP: u8 = 8
+let K_BACKREF: u8 = 9
+let K_LOOK: u8 = 10
+
+# ECMAScript node flags (Node.flags): the modifiers in force where the node was parsed.
+let F_IC: u8 = 1
+let F_DOTALL: u8 = 2
+let F_MULTI: u8 = 4
+
+# mark: Anchors ================================================================================
+
+# Oniguruma anchors.
+let AN_BOL: u8 = 0
+let AN_EOL: u8 = 1
+let AN_WORDB: u8 = 2
+let AN_NWORDB: u8 = 3
+let AN_BUFS: u8 = 4
+let AN_G: u8 = 5
+let AN_BUFE: u8 = 6
+# ECMAScript anchors: `^` and `$` without and with the m flag, `\b` and `\B` without and
+# with the ui flags (where U+017F and U+212A are word characters).
+let AN_ES_BOL: u8 = 7
+let AN_ES_BOL_M: u8 = 8
+let AN_ES_EOL: u8 = 9
+let AN_ES_EOL_M: u8 = 10
+let AN_ES_WB: u8 = 11
+let AN_ES_NWB: u8 = 12
+let AN_ES_WB_I: u8 = 13
+let AN_ES_NWB_I: u8 = 14
+
+# mark: Opcodes ================================================================================
+
+let OP_CHAR: u8 = 0      # ch
+let OP_ANY: u8 = 1
+let OP_CLASS: u8 = 2     # x = class index
+let OP_MATCH: u8 = 3
+let OP_JMP: u8 = 4       # x = target
+let OP_SPLIT: u8 = 5     # x = preferred target, y = alternative
+let OP_SAVE: u8 = 6      # x = capture slot
+let OP_ASSERT: u8 = 7    # x = anchor kind
+let OP_BACKREF: u8 = 8   # x = group index
+let OP_LOOK: u8 = 9      # x = subprogram index; ahead, negate
+let OP_MARK: u8 = 10     # x = mark slot (record position)
+let OP_PROGRESS: u8 = 11 # x = mark slot: fail if the position has not advanced (empty-loop guard)
+# ECMAScript only. A register is a slot of `caps` after the capture pairs, so the save log
+# undoes its changes on backtracking like a capture's.
+let OP_CHAR_I: u8 = 12       # ch = canonicalized code point; compare the canonicalized subject
+let OP_DOT: u8 = 13          # any code point but a line terminator
+let OP_ANY_ALL: u8 = 14      # any code point
+let OP_RANGE: u8 = 15        # x = class index (sorted inclusive ranges)
+let OP_RANGE_I: u8 = 16      # the same over the canonicalized subject
+let OP_PREV: u8 = 17         # step back over one code point (backward matching)
+let OP_SAVE_RESET: u8 = 18   # unset the groups x..=y
+let OP_SET_REG: u8 = 19      # register slot x = y
+let OP_SET_POS: u8 = 20      # register slot x = the position
+let OP_CHECK_ADV: u8 = 21    # fail if register slot x holds the position
+let OP_LOOP: u8 = 22         # decrement slot x; jump to y unless it reached 0
+let OP_LOOP_SPLIT: u8 = 23   # counted loop with a split: slot x, target y, limit ch;
+                             # ahead = greedy, negate = check that the iteration advanced
+let OP_LOOK_START: u8 = 24   # push a lookaround marker; negate; x = continuation when negated
+let OP_LOOK_MATCH: u8 = 25   # a positive lookaround matched: drop its choice points
+let OP_NLOOK_MATCH: u8 = 26  # a negative lookaround's body matched: the lookaround fails
+let OP_BACKREF_ES: u8 = 27   # groups ref_lists[x ..< x + y]; ch bit 0 = ignore case,
+                             # bit 1 = backward
+
+# Builtin character-class bits (Oniguruma).
+let B_d: u32 = 1
+let B_D: u32 = 2
+let B_w: u32 = 4
+let B_W: u32 = 8
+let B_s: u32 = 16
+let B_S: u32 = 32
+let B_h: u32 = 64
+let B_H: u32 = 128
+
+let INT32_MAX: i32 = 2147483647
+
+# mark: The allocation hook ====================================================================
+
+## Where a program's memory comes from: `realloc_func(opaque, ptr, size)` with C `realloc`
+## semantics (a size of zero frees and answers none). A program of the Oniguruma dialect has
+## no hook and uses `memory.heap`; an ECMAScript program uses the host's hook, or C's
+## `realloc` when the host gives none.
+pub type ReallocFunc = func(void*?, void*?, usize) -> void*?
+
+struct Heap:
+    var realloc_func: ReallocFunc?
+    var opaque: void*?
+
+func heap_alloc[T](h: const Heap*, count: usize) -> T[]!:
+    if let rf = h.realloc_func:
+        let p = rf(h.opaque, none, count * sizeof(T)) else error(memory.exhausted, "regex: out of memory")
+        return T[]((T*)p, count)
+    return try alloc T[count] in memory.heap
+
+func heap_free[T](h: const Heap*, data: T[]):
+    if data.length == 0:
+        return
+    if let rf = h.realloc_func:
+        discard(rf(h.opaque, data.data, 0))
+    else:
+        free(data) in memory.heap
+
+# C's realloc as a hook (a size of zero frees).
+func c_heap_realloc(opaque: void*?, ptr: void*?, size: usize) -> void*?:
+    if size == 0:
+        unicode.c_free(ptr)
+        return none
+    return unicode.c_realloc(ptr, size)
+
+# mark: A growable vector ======================================================================
+
+## A minimal growable array. Backtrack and save-log stacks are reused across match attempts,
+## so matching allocates nothing per step once they are warm.
+struct Vec[T]:
+    var data: T[]
+    var used: usize = 0
+    var heap: Heap
+
+    mutating func ensure(count: usize) -> !:
+        if count <= self.data.length:
+            return
+        var capacity: usize = 8 if self.data.length == 0 else self.data.length * 2
+        while capacity < count:
+            capacity = capacity * 2
+        let grown = try heap_alloc[T](&self.heap, capacity)
+        var i: usize = 0
+        while i < self.used:
+            grown[i] = self.data[i]
+            i += 1
+        heap_free[T](&self.heap, self.data)
+        self.data = grown
+
+    mutating func push(value: T) -> usize!:
+        try self.ensure(self.used + 1)
+        self.data[self.used] = value
+        self.used += 1
+        return self.used - 1
+
+    ## Set index `i`, growing by one when `i` is at the end; false when memory runs out.
+    mutating func put(i: usize, value: T) -> bool:
+        if i < self.used:
+            self.data[i] = value
+            return true
+        self.ensure(i + 1) catch failure:
+            return false
+        self.data[i] = value
+        self.used = i + 1
+        return true
+
+    mutating func free_all():
+        heap_free[T](&self.heap, self.data)
+        var empty: T[]
+        self.data = empty
+        self.used = 0

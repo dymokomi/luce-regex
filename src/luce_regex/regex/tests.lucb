@@ -1,0 +1,81 @@
+#==============================================================================================
+#
+#   tests - Tests of the Oniguruma dialect
+#
+#==============================================================================================
+
+func span_is(pattern: str, text: str, s: i32, e: i32) -> bool!:
+    var result = false
+    with memory.heap:
+        let re = try new Regex(pattern, false)
+        defer free(re)
+        defer re.close()
+        let matched = re.find(text, 0, 0)
+        if s < 0:
+            result = not matched
+        else:
+            result = matched and re.match_start() == s and re.match_end() == e
+    return result
+
+func span_is_ic(pattern: str, text: str, s: i32, e: i32) -> bool!:
+    var result = false
+    with memory.heap:
+        let re = try new Regex(pattern, true)
+        defer free(re)
+        defer re.close()
+        let matched = re.find(text, 0, 0)
+        if s < 0:
+            result = not matched
+        else:
+            result = matched and re.match_start() == s and re.match_end() == e
+    return result
+
+func group_is(pattern: str, text: str, index: i32, s: i32, e: i32) -> bool!:
+    var result = false
+    with memory.heap:
+        let re = try new Regex(pattern, false)
+        defer free(re)
+        defer re.close()
+        let matched = re.find(text, 0, 0)
+        result = matched and re.group_start(index) == s and re.group_end(index) == e
+    return result
+
+test "regex literals, classes and anchors":
+    assert(try span_is("abc", "xxabcyy", 2, 5))
+    assert(try span_is("a.c", "zza-cw", 2, 5))
+    assert(try span_is("[0-9]+", "abc123def", 3, 6))
+    assert(try span_is("[^0-9]+", "12ab34", 2, 4))
+    assert(try span_is("\\d+", "x42", 1, 3))
+    assert(try span_is("\\w+", " abc_1 ", 1, 6))
+    assert(try span_is("[\\w.]+", "a.b c", 0, 3))
+    assert(try span_is("^abc", "abcx", 0, 3))
+    assert(try span_is("^abc", "xabc", -1, -1))
+    assert(try span_is("abc$", "abc", 0, 3))
+    assert(try span_is("abc$", "abcd", -1, -1))
+    assert(try span_is("a\\.b", "a.b", 0, 3))
+    assert(try span_is("a\\.b", "axb", -1, -1))
+    assert(try span_is("", "abc", 0, 0))
+    assert(try span_is("[[:digit:]]+", "ab12", 2, 4))
+
+test "regex alternation, quantifiers and word boundaries":
+    assert(try span_is("a|bb|ccc", "zzccc", 2, 5))
+    assert(try span_is("ab{2,3}c", "abbbc", 0, 5))
+    assert(try span_is("ab{2,3}c", "abc", -1, -1))
+    assert(try span_is("ab{2}c", "abbc", 0, 4))
+    assert(try span_is("\\bcat\\b", "a cat!", 2, 5))
+    assert(try span_is("\\bcat\\b", "concatenate", -1, -1))
+    assert(try group_is("a(.*?)b", "axxbxxb", 1, 1, 3))
+    assert(try group_is("a(.*)b", "axxbxxb", 1, 1, 6))
+
+test "regex groups, backrefs and lookaround":
+    assert(try group_is("(ab)+", "ababab", 1, 4, 6))
+    assert(try group_is("(?<word>\\w+)", "  hey ", 1, 2, 5))
+    assert(try span_is("(ab)\\1", "abab", 0, 4))
+    assert(try span_is("(ab)\\1", "abcd", -1, -1))
+    assert(try span_is("foo(?=bar)", "foobar", 0, 3))
+    assert(try span_is("foo(?=bar)", "foobaz", -1, -1))
+    assert(try span_is("foo(?!bar)", "foobaz", 0, 3))
+    assert(try span_is("foo(?!bar)", "foobar", -1, -1))
+    assert(try span_is("(?<=@)\\w+", "hi @name", 4, 8))
+    assert(try span_is_ic("abc", "XXABCyy", 2, 5))
+    assert(try span_is("abc", "ABC", -1, -1))
