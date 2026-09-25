@@ -4,7 +4,7 @@ def package "luce-regex" {
     str version = "0.2.0"
     str kind = "package"
     str language = "luce-base"
-    str description = "A small, fast, from-scratch regular-expression engine written in luce-base with two dialects: the Oniguruma subset that TextMate grammars use, and ECMAScript (ES2025 RegExp, QuickJS-exact) over UTF-16 subjects for luce-js. It also exports QuickJS's libunicode ported to luce-base. It depends only on the standard library — there is no external regex."
+    str description = "A fast regular-expression engine in luce-base with two dialects: the Oniguruma subset TextMate grammars use, and ECMAScript (QuickJS-exact) for luce-js. Also exports a port of libunicode."
     str readme = "README.md"
 
     def export "regex" {
