@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-regex" {
     str owner = "dymokomi"
-    str version = "0.2.1"
+    str version = "0.2.2"
     str kind = "package"
     str language = "luce-base"
     str description = "A fast regular-expression engine in luce-base with two dialects: the Oniguruma subset TextMate grammars use, and ECMAScript (QuickJS-exact) for luce-js. Also exports a port of libunicode."
