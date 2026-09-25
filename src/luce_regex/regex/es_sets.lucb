@@ -73,7 +73,6 @@ func set_bucket(s: const StrSet*, cps: const u32[]) -> usize:
         if e < 0 or same_cps(set_string(s, (usize)e), cps):
             return h
         h = (h + 1) & mask
-    return 0
 
 func set_has_string(s: const StrSet*, cps: const u32[]) -> bool:
     if s.offs.used == 0:

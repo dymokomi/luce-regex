@@ -202,4 +202,3 @@ func es_run[S: Units](re: Regex*, src: const S*, code: const Inst[], sp0: i32, s
                 pc = -2 - pc
                 break
             # the body of a positive lookaround failed: so does the lookaround
-    return RUN_FAIL

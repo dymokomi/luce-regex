@@ -306,7 +306,6 @@ func es_exec[S: Units](re: Regex*, src: const S*, start: i32, captures: i32[], h
         if sticky or at >= re.len:
             return exec_no_match
         at += src.width(src.next(at))
-    return exec_no_match
 
 # mark: First-character filter =================================================================
 

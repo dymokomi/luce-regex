@@ -264,7 +264,6 @@ func lre_is_in_table(c: u32, table: const u8[], index_table: const u8[]) -> bool
         if c < code:
             return bit
         bit = not bit
-    return bit
 
 ## True if `c` is cased (has a case mapping or the Cased property).
 pub func lre_is_cased(c: u32) -> bool:

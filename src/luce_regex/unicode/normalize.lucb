@@ -272,7 +272,6 @@ func unicode_get_cc(c: u32) -> i32:
                 _:
                     return 230
         code = c1
-    return 0
 
 func sort_cc(buf: u32[]):
     let len = (i32)buf.length

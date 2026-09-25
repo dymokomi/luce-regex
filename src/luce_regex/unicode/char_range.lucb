@@ -13,11 +13,6 @@
 
 # character range
 
-func cr_dump(cr: const CharRange*):
-    let points = cr_points(cr)
-    for i in 0..<points.length:
-        print(f"{i}: 0x{hex(points[i])}")
-
 func cr_default_realloc(opaque: void*?, ptr: void*?, size: usize) -> void*?:
     return c_realloc(ptr, size)
 

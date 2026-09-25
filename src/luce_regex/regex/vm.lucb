@@ -122,4 +122,3 @@ func run_prog[S: Units](re: Regex*, src: const S*, code: const Inst[], sp0: i32,
                 log -= 1
                 re.caps[(usize)st.log_slot.data[log]] = st.log_val.data[log]
             break
-    return RUN_FAIL
