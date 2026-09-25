@@ -146,6 +146,15 @@ func decode_units(subject: str, out: Vec[u16]*):
             discard(out.push((u16)b[i]) catch failure: trap("out of memory"))
             i += 1
 
+# mark: Known deviations =======================================================================
+
+# A row where this engine follows ECMAScript and libregexp does not: libregexp emits a v-flag
+# class string inside a lookbehind forward (PREV, the string's characters, PREV), so a string
+# of more than one character cannot match there; this engine matches it backward, as the
+# specification's backward matcher does (V8 answers the same).
+func exec_deviation(c: const ExecCase*, got: str) -> bool:
+    return c.pattern == "(?<=[\\q{ab}])c" and c.flags == es_unicode_sets and got == "1 2,3"
+
 # mark: Checks =================================================================================
 
 func check_compile(c: const CompileCase*) -> bool:
@@ -216,7 +225,9 @@ func check_exec(c: const ExecCase*) -> bool:
                 t.add_int(z)
             else:
                 t.add(" -".bytes)
-    let ok = t.view() == c.expect
+    var ok = t.view() == c.expect
+    if not ok and exec_deviation(c, t.view()):
+        ok = true
     if not ok:
         print(f"exec /{c.pattern}/ {c.flags} mode {c.mode} on \"{c.subject}\" type {c.cbuf_type} at {c.cindex}:\n  got    {t.view()}\n  expect {c.expect}")
     return ok
@@ -255,3 +266,91 @@ test "parse_escape":
             print(f"escape \"{c.text}\" {c.allow_utf16}: got {got}, expect {c.expect}")
             failures += 1
     assert(failures == 0)
+
+test "ECMAScript extra rows: lookbehind, loops, names, modifiers, folding, surrogates, sets":
+    var failures: i32 = 0
+    for c in &es_extra_compile_cases:
+        if not check_compile(c):
+            failures += 1
+    for c in &es_extra_exec_cases:
+        if not check_exec(c):
+            failures += 1
+    let total = es_extra_compile_cases.length + es_extra_exec_cases.length
+    print(f"extra rows: {total - (usize)failures} of {total} pass")
+    assert(failures == 0)
+
+# mark: The API ================================================================================
+
+func units16(text: str, out: Vec[u16]*):
+    for ch in text:
+        let c = (u32)ch
+        if c > 0xFFFF:
+            discard(out.push((u16)(0xD800 + ((c - 0x10000) >> 10))) catch failure: trap("oom"))
+            discard(out.push((u16)(0xDC00 + ((c - 0x10000) & 0x3FF))) catch failure: trap("oom"))
+        else:
+            discard(out.push((u16)c) catch failure: trap("oom"))
+
+test "compile_ecmascript16 encodes UTF-16 patterns as QuickJS does":
+    var message: u8[64]
+    var pat = Vec[u16]()
+    defer pat.free_all()
+    units16("(?<x>\u{1F600})+", &pat)
+    var subj = Vec[u16]()
+    defer subj.free_all()
+    units16("a\u{1F600}\u{1F600}b", &subj)
+    var caps: i32[4]
+    # with u: one code point, the pair
+    let re_u = compile_ecmascript16(pat.data[..<pat.used], es_unicode, message, none) else trap("compile")
+    assert(exec16(re_u, subj.data[..<subj.used], 0, caps, none) == exec_match)
+    assert(caps[0] == 1 and caps[1] == 5 and caps[2] == 3 and caps[3] == 5)
+    assert(re_u.group_of("x") == 1 and re_u.group_of("y") == -1)
+    free_ecmascript(re_u)
+    # without u: two code units, so a quantifier after the character repeats the low
+    # surrogate alone
+    var pat2 = Vec[u16]()
+    defer pat2.free_all()
+    units16("\u{1F600}+", &pat2)
+    let re = compile_ecmascript16(pat2.data[..<pat2.used], 0, message, none) else trap("compile")
+    assert(exec16(re, subj.data[..<subj.used], 0, caps, none) == exec_match)
+    assert(caps[0] == 1 and caps[1] == 3)
+    free_ecmascript(re)
+    let re2 = compile_ecmascript16(pat2.data[..<pat2.used], es_unicode, message, none) else trap("compile")
+    assert(exec16(re2, subj.data[..<subj.used], 0, caps, none) == exec_match)
+    assert(caps[0] == 1 and caps[1] == 5)
+    free_ecmascript(re2)
+
+test "compile_ecmascript reports QuickJS's messages, truncated to the buffer":
+    var message: u8[8]
+    assert(compile_ecmascript("a)".bytes, 0, message, none) == none)
+    assert((str)message[0..<7] == "extrane" and message[7] == 0)
+    var full: u8[64]
+    assert(compile_ecmascript("(?ii:a)".bytes, 0, full, none) == none)
+    var n: usize = 0
+    while full[n] != 0:
+        n += 1
+    assert((str)full[0..<n] == "duplicate modifier: 'i'")
+    let re = compile_ecmascript("(?<first>a)(b)".bytes, es_global | es_indices, full, none) else trap("compile")
+    assert(full[0] == 0)
+    assert(capture_count(re) == 3)
+    assert(program_flags(re) == (es_global | es_indices | es_named_groups))
+    let names = group_names(re) else trap("no names")
+    assert(names.length == 9 and (str)names[0..<5] == "first" and names[5] == 0 and names[7] == 0)
+    free_ecmascript(re)
+
+var interrupt_calls: i32 = 0
+
+func count_and_stop(opaque: void*?) -> bool:
+    interrupt_calls += 1
+    return interrupt_calls >= 3
+
+test "exec polls check_timeout and stops when asked":
+    var message: u8[64]
+    let re = compile_ecmascript("(a*)*b".bytes, 0, message, none) else trap("compile")
+    defer free_ecmascript(re)
+    var caps: i32[4]
+    let host = Host(check_timeout = count_and_stop)
+    assert(exec8(re, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".bytes, 0, caps, &host) == exec_interrupted)
+    assert(interrupt_calls == 3)
+    # the same program still matches afterwards
+    assert(exec8(re, "aaab".bytes, 0, caps, none) == exec_match)
+    assert(caps[0] == 0 and caps[1] == 4 and caps[2] == 0 and caps[3] == 3)

@@ -19,4 +19,5 @@ es_table_compile.lucb
 es_table_exec1.lucb
 es_table_exec2.lucb
 es_table_escape.lucb
+es_table_extra.lucb
 es_tests.lucb
