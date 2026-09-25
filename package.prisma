@@ -11,6 +11,10 @@ def package "luce-regex" {
         str module = "luce_regex.regex"
     }
 
+    def export "unicode" {
+        str module = "luce_regex.unicode"
+    }
+
     def dependency "luce-std" {
         str owner = "dymokomi"
         str version = "^0.1.0"
