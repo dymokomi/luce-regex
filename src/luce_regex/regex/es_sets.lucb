@@ -209,6 +209,7 @@ let CLASS_RANGE_BASE: i32 = 0x40000000
 # cr_init_char_range
 func init_char_range(ps: const EsParse*, s: StrSet*, c: u32) -> !:
     set_init(ps, s)
+    errdefer set_free(s)
     var points: const u32[] = char_range_d
     if (c >> 1) == 1:
         points = char_range_s

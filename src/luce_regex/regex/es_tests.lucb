@@ -38,15 +38,22 @@ struct EscapeCase:
 # mark: Hosts ==================================================================================
 
 var test_alloc_left: i32 = 0
+# blocks allocated through test_limited_realloc and not yet freed: every test ends at zero
+var test_live_blocks: i32 = 0
 
 func test_limited_realloc(opaque: void*?, ptr: void*?, size: usize) -> void*?:
     if size == 0:
+        if ptr != none:
+            test_live_blocks -= 1
         unicode.c_free(ptr)
         return none
     if test_alloc_left <= 0:
         return none
     test_alloc_left -= 1
-    return unicode.c_realloc(ptr, size)
+    let p = unicode.c_realloc(ptr, size)
+    if ptr == none and p != none:
+        test_live_blocks += 1
+    return p
 
 func test_yes(opaque: void*?, size: usize) -> bool:
     return true
@@ -55,14 +62,15 @@ func test_timeout(opaque: void*?) -> bool:
     return true
 
 func test_host(mode: i32) -> Host:
-    var host = Host()
+    # every allocation is counted; only mode 100 + N limits them
+    test_alloc_left = 1000000000
+    var host = Host(realloc_func = test_limited_realloc)
     if mode == 1:
         host.check_timeout = test_timeout
     elif mode == 2:
         host.check_stack_overflow = test_yes
     elif mode >= 100:
         test_alloc_left = mode - 100
-        host.realloc_func = test_limited_realloc
     return host
 
 # mark: Descriptions ===========================================================================
@@ -158,6 +166,8 @@ func exec_deviation(c: const ExecCase*, got: str) -> bool:
 # mark: Checks =================================================================================
 
 func check_compile(c: const CompileCase*) -> bool:
+    let live0 = test_live_blocks
+    defer if_leak(c, live0)
     let host = test_host(c.mode)
     var message: u8[64]
     let re = compile_ecmascript(c.pattern.bytes, c.flags, message, &host)
@@ -174,6 +184,10 @@ func check_compile(c: const CompileCase*) -> bool:
     if let prog = re:
         free_ecmascript(prog)
     return ok
+
+func if_leak(c: const CompileCase*, live0: i32):
+    if test_live_blocks != live0:
+        print(f"LEAK {test_live_blocks - live0} /{c.pattern}/ {c.flags} mode {c.mode}")
 
 func check_exec(c: const ExecCase*) -> bool:
     # compile with an allocator that only starts counting for the exec
@@ -205,9 +219,7 @@ func check_exec(c: const ExecCase*) -> bool:
     let cc = capture_count(re)
     let captures = alloc i32[(usize)(2 * cc)] in memory.heap catch failure: trap("out of memory")
     defer free(captures) in memory.heap
-    var host = test_host(c.mode)
-    if c.mode >= 100:
-        host.realloc_func = none
+    let host = test_host(c.mode)
     var ret: i32 = 0
     if c.cbuf_type == 0:
         ret = exec8(re, bytes.data[..<bytes.used], c.cindex, captures, &host)
@@ -241,6 +253,7 @@ test "ECMAScript compile: capture counts, flags, group names and error messages"
             failures += 1
     print(f"compile rows: {es_compile_cases.length - (usize)failures} of {es_compile_cases.length} pass")
     assert(failures == 0)
+    assert(test_live_blocks == 0, "a compile leaked")
 
 test "ECMAScript exec: captures over 8-bit and 16-bit subjects":
     var failures: i32 = 0
@@ -253,6 +266,7 @@ test "ECMAScript exec: captures over 8-bit and 16-bit subjects":
     let total = es_exec_cases1.length + es_exec_cases2.length
     print(f"exec rows: {total - (usize)failures} of {total} pass")
     assert(failures == 0)
+    assert(test_live_blocks == 0, "an exec leaked")
 
 test "parse_escape":
     var failures: i32 = 0
@@ -278,6 +292,7 @@ test "ECMAScript extra rows: lookbehind, loops, names, modifiers, folding, surro
     let total = es_extra_compile_cases.length + es_extra_exec_cases.length
     print(f"extra rows: {total - (usize)failures} of {total} pass")
     assert(failures == 0)
+    assert(test_live_blocks == 0, "a compile or exec leaked")
 
 # mark: The API ================================================================================
 
