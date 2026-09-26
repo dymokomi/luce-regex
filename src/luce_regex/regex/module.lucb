@@ -74,38 +74,38 @@ let AN_ES_NWB_I: u8 = 14
 
 # mark: Opcodes ================================================================================
 
-let OP_CHAR: u8 = 0      # ch
+let OP_CHAR: u8 = 0  # ch
 let OP_ANY: u8 = 1
-let OP_CLASS: u8 = 2     # x = class index
+let OP_CLASS: u8 = 2  # x = class index
 let OP_MATCH: u8 = 3
-let OP_JMP: u8 = 4       # x = target
-let OP_SPLIT: u8 = 5     # x = preferred target, y = alternative
-let OP_SAVE: u8 = 6      # x = capture slot
-let OP_ASSERT: u8 = 7    # x = anchor kind
-let OP_BACKREF: u8 = 8   # x = group index
-let OP_LOOK: u8 = 9      # x = subprogram index; ahead, negate
-let OP_MARK: u8 = 10     # x = mark slot (record position)
-let OP_PROGRESS: u8 = 11 # x = mark slot: fail if the position has not advanced (empty-loop guard)
+let OP_JMP: u8 = 4  # x = target
+let OP_SPLIT: u8 = 5  # x = preferred target, y = alternative
+let OP_SAVE: u8 = 6  # x = capture slot
+let OP_ASSERT: u8 = 7  # x = anchor kind
+let OP_BACKREF: u8 = 8  # x = group index
+let OP_LOOK: u8 = 9  # x = subprogram index; ahead, negate
+let OP_MARK: u8 = 10  # x = mark slot (record position)
+let OP_PROGRESS: u8 = 11  # x = mark slot: fail if the position has not advanced (empty-loop guard)
 # ECMAScript only. A register is a slot of `caps` after the capture pairs, so the save log
 # undoes its changes on backtracking like a capture's.
-let OP_CHAR_I: u8 = 12       # ch = canonicalized code point; compare the canonicalized subject
-let OP_DOT: u8 = 13          # any code point but a line terminator
-let OP_ANY_ALL: u8 = 14      # any code point
-let OP_RANGE: u8 = 15        # x = class index (sorted inclusive ranges)
-let OP_RANGE_I: u8 = 16      # the same over the canonicalized subject
-let OP_PREV: u8 = 17         # step back over one code point (backward matching)
-let OP_SAVE_RESET: u8 = 18   # unset the groups x..=y
-let OP_SET_REG: u8 = 19      # register slot x = y
-let OP_SET_POS: u8 = 20      # register slot x = the position
-let OP_CHECK_ADV: u8 = 21    # fail if register slot x holds the position
-let OP_LOOP: u8 = 22         # decrement slot x; jump to y unless it reached 0
-let OP_LOOP_SPLIT: u8 = 23   # counted loop with a split: slot x, target y, limit ch;
-                             # ahead = greedy, negate = check that the iteration advanced
-let OP_LOOK_START: u8 = 24   # push a lookaround marker; negate; x = continuation when negated
-let OP_LOOK_MATCH: u8 = 25   # a positive lookaround matched: drop its choice points
+let OP_CHAR_I: u8 = 12  # ch = canonicalized code point; compare the canonicalized subject
+let OP_DOT: u8 = 13  # any code point but a line terminator
+let OP_ANY_ALL: u8 = 14  # any code point
+let OP_RANGE: u8 = 15  # x = class index (sorted inclusive ranges)
+let OP_RANGE_I: u8 = 16  # the same over the canonicalized subject
+let OP_PREV: u8 = 17  # step back over one code point (backward matching)
+let OP_SAVE_RESET: u8 = 18  # unset the groups x..=y
+let OP_SET_REG: u8 = 19  # register slot x = y
+let OP_SET_POS: u8 = 20  # register slot x = the position
+let OP_CHECK_ADV: u8 = 21  # fail if register slot x holds the position
+let OP_LOOP: u8 = 22  # decrement slot x; jump to y unless it reached 0
+let OP_LOOP_SPLIT: u8 = 23  # counted loop with a split: slot x, target y, limit ch;
+# ahead = greedy, negate = check that the iteration advanced
+let OP_LOOK_START: u8 = 24  # push a lookaround marker; negate; x = continuation when negated
+let OP_LOOK_MATCH: u8 = 25  # a positive lookaround matched: drop its choice points
 let OP_NLOOK_MATCH: u8 = 26  # a negative lookaround's body matched: the lookaround fails
-let OP_BACKREF_ES: u8 = 27   # groups ref_lists[x ..< x + y]; ch bit 0 = ignore case,
-                             # bit 1 = backward
+let OP_BACKREF_ES: u8 = 27  # groups ref_lists[x ..< x + y]; ch bit 0 = ignore case,
+# bit 1 = backward
 
 # Builtin character-class bits (Oniguruma).
 let B_d: u32 = 1

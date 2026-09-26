@@ -15,8 +15,11 @@
 
 interface Units:
     func count() -> i32
+
     func next(pos: i32) -> u32
+
     func width(c: u32) -> i32
+
     func prev(pos: i32) -> u32
 
 # The Oniguruma subject: Unicode code points.

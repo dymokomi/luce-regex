@@ -52,7 +52,7 @@ func str_hash(cps: const u32[]) -> u32:
 func set_string(s: const StrSet*, i: usize) -> const u32[]:
     let off = (usize)s.offs.data[i]
     let n = (usize)s.pool.data[off]
-    return s.pool.data[off + 1 ..< off + 1 + n]
+    return s.pool.data[off + 1..<off + 1 + n]
 
 func same_cps(a: const u32[], b: const u32[]) -> bool:
     if a.length != b.length:

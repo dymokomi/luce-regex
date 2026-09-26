@@ -15,29 +15,29 @@
 let unicode_decomp_len_max: i32 = 18
 
 enum DecompTypeEnum as u32:
-    c1 = 0     # 16 bit char
-    l1 = 1     # 16 bit char table
+    c1 = 0  # 16 bit char
+    l1 = 1  # 16 bit char table
     l2 = 2
     l3 = 3
     l4 = 4
-    l5 = 5     # XXX: not used
-    l6 = 6     # XXX: could remove
-    l7 = 7     # XXX: could remove
-    ll1 = 8    # 18 bit char table
+    l5 = 5  # XXX: not used
+    l6 = 6  # XXX: could remove
+    l7 = 7  # XXX: could remove
+    ll1 = 8  # 18 bit char table
     ll2 = 9
-    s1 = 10    # 8 bit char table
+    s1 = 10  # 8 bit char table
     s2 = 11
     s3 = 12
     s4 = 13
     s5 = 14
-    i1 = 15    # increment 16 bit char value
+    i1 = 15  # increment 16 bit char value
     i2_0 = 16
     i2_1 = 17
     i3_1 = 18
     i3_2 = 19
     i4_1 = 20
     i4_2 = 21
-    b1 = 22    # 16 bit base + 8 bit offset
+    b1 = 22  # 16 bit base + 8 bit offset
     b2 = 23
     b3 = 24
     b4 = 25
@@ -321,12 +321,9 @@ func to_nfd_rec(dbuf: DynBuf*, src: const u32[], is_compat: bool):
 # return 0 if not found
 func compose_pair(c0: u32, c1: u32) -> i32:
     # Hangul composition
-    if (c0 >= 0x1100 and c0 < 0x1100 + 19 and
-            c1 >= 0x1161 and c1 < 0x1161 + 21):
+    if (c0 >= 0x1100 and c0 < 0x1100 + 19 and c1 >= 0x1161 and c1 < 0x1161 + 21):
         return (i32)(0xac00 + (c0 - 0x1100) * 588 + (c1 - 0x1161) * 28)
-    elif (c0 >= 0xac00 and c0 < 0xac00 + 11172 and
-            (c0 - 0xac00) % 28 == 0 and
-            c1 >= 0x11a7 and c1 < 0x11a7 + 28):
+    elif (c0 >= 0xac00 and c0 < 0xac00 + 11172 and (c0 - 0xac00) % 28 == 0 and c1 >= 0x11a7 and c1 < 0x11a7 + 28):
         return (i32)(c0 + c1 - 0x11a7)
     else:
         return unicode_compose_pair(c0, c1)

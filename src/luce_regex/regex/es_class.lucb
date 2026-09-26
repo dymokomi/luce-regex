@@ -16,10 +16,7 @@
 
 # XXX: we use the same chars for name and value
 func is_unicode_char(c: u8) -> bool:
-    return ((c >= '0' and c <= '9') or
-            (c >= 'A' and c <= 'Z') or
-            (c >= 'a' and c <= 'z') or
-            (c == '_'))
+    return ((c >= '0' and c <= '9') or (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c == '_'))
 
 # The collection of a sequence property's strings (C's seq_prop_cb).
 struct SeqCollect:
@@ -149,7 +146,7 @@ func parse_class_string_disjunction(ps: EsParse*, s: StrSet*) -> !:
         ps.p += 1
     if ps.ignore_case:
         try set_canonicalize(ps, s, true)
-    ps.p += 1 # skip the '}'
+    ps.p += 1  # skip the '}'
 
 # mark: Class atoms ============================================================================
 
@@ -207,8 +204,7 @@ func get_class_atom(ps: EsParse*, s: StrSet*?, inclass: bool) -> i32!:
                 class_range = true
             'c':
                 let b = cur(ps)
-                if ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or
-                    (((b >= '0' and b <= '9') or b == '_') and inclass and not ps.is_unicode)):
+                if ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (((b >= '0' and b <= '9') or b == '_') and inclass and not ps.is_unicode)):
                     # Annex B.1.4
                     c = (u32)(b & 0x1f)
                     ps.p += 1
@@ -316,7 +312,7 @@ func parse_nested_class(ps: EsParse*, s: StrSet*) -> !:
     try es_check_stack(ps)
     set_init(ps, s)
     errdefer set_free(s)
-    ps.p += 1 # skip '['
+    ps.p += 1  # skip '['
     var invert = false
     if cur(ps) == '^':
         ps.p += 1
@@ -367,7 +363,7 @@ func parse_nested_class(ps: EsParse*, s: StrSet*) -> !:
                             try cr_check(unicode.cr_op1(&s.cr, unicode.cr_points(&cr2), unicode.cr_op_union))
                         else:
                             try cr_check(unicode.cr_union_interval(&s.cr, (u32)c1, (u32)c2))
-                        is_first = false # union operation
+                        is_first = false  # union operation
             if atom:
                 if c1 >= CLASS_RANGE_BASE:
                     try set_union_free(s, &s1)
@@ -400,7 +396,7 @@ func parse_nested_class(ps: EsParse*, s: StrSet*) -> !:
                     try parse_class_set_operand(ps, &s1)
                     try set_op_free(s, &s1, unicode.cr_op_sub)
         is_first = false
-    ps.p += 1 # skip ']'
+    ps.p += 1  # skip ']'
     if invert:
         # XXX: add may_contain_string syntax check to be fully
         # compliant. The test here accepts more input than the

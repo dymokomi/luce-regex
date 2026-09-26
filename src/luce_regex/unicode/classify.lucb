@@ -27,37 +27,30 @@ pub let lre_ctype_bits: u8[256] = [
     0, ct_s, ct_s, ct_s, ct_s, ct_s, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-
     ct_s, 0, 0, 0, ct_dollar, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     ct_x | ct_d, ct_x | ct_d, ct_x | ct_d, ct_x | ct_d, ct_x | ct_d, ct_x | ct_d, ct_x | ct_d, ct_x | ct_d,
     ct_x | ct_d, ct_x | ct_d, 0, 0, 0, 0, 0, 0,
-
     0, ct_x | ct_u, ct_x | ct_u, ct_x | ct_u, ct_x | ct_u, ct_x | ct_u, ct_x | ct_u, ct_u,
     ct_u, ct_u, ct_u, ct_u, ct_u, ct_u, ct_u, ct_u,
     ct_u, ct_u, ct_u, ct_u, ct_u, ct_u, ct_u, ct_u,
     ct_u, ct_u, ct_u, 0, 0, 0, 0, ct_under,
-
     0, ct_x | ct_l, ct_x | ct_l, ct_x | ct_l, ct_x | ct_l, ct_x | ct_l, ct_x | ct_l, ct_l,
     ct_l, ct_l, ct_l, ct_l, ct_l, ct_l, ct_l, ct_l,
     ct_l, ct_l, ct_l, ct_l, ct_l, ct_l, ct_l, ct_l,
     ct_l, ct_l, ct_l, 0, 0, 0, 0, 0,
-
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-
     ct_s, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,

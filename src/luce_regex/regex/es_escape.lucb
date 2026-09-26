@@ -41,14 +41,14 @@ struct EsParse:
     var src: const u8[]
     var p: usize
     var is_unicode: bool
-    var unicode_sets: bool # if set, is_unicode is also set
+    var unicode_sets: bool  # if set, is_unicode is also set
     var ignore_case: bool
     var multi_line: bool
     var dotall: bool
     var group_name_scope: u8
     var capture_count: i32
-    var total_capture_count: i32 # -1 = not computed yet
-    var has_named_captures: i32 # -1 = don't know, 0 = no, 1 = yes
+    var total_capture_count: i32  # -1 = not computed yet
+    var has_named_captures: i32  # -1 = don't know, 0 = no, 1 = yes
     var check_stack: (func(void*?, usize) -> bool)?
     var opaque: void*?
     var message: u8[128]

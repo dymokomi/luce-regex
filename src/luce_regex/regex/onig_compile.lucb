@@ -73,7 +73,8 @@ func compile_node(re: Regex*, ni: i32, out: Vec[Inst]*) -> !:
         inst.ahead = node.ahead
         inst.negate = node.negate
         discard(try out.push(inst))
-    # K_EMPTY and anything else emit nothing.
+
+# K_EMPTY and anything else emit nothing.
 
 func compile_alt(re: Regex*, ni: i32, out: Vec[Inst]*) -> !:
     let node = re.nodes.data[(usize)ni]

@@ -90,7 +90,8 @@ func es_compile(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
         try es_compile(re, node.first_child, out, not node.ahead)
         discard(try emit(out, OP_NLOOK_MATCH if node.negate else OP_LOOK_MATCH, 0, 0))
         out.data[start].x = (i32)out.used
-    # K_EMPTY emits nothing.
+
+# K_EMPTY emits nothing.
 
 func es_compile_alt(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
     let node = re.nodes.data[(usize)ni]

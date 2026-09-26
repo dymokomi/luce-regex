@@ -100,10 +100,10 @@ func es_parse_alternative(ps: EsParse*) -> i32!:
 
 func es_parse_term(ps: EsParse*) -> i32!:
     let re = ps.re
-    var atom: i32 = -1            # a quantifiable atom (C's last_atom_start >= 0)
+    var atom: i32 = -1  # a quantifiable atom (C's last_atom_start >= 0)
     var last_capture_count: i32 = 0
-    var class_atom = false        # C's goto parse_class_atom
-    var char_value: i32 = -1      # C's goto normal_char with c
+    var class_atom = false  # C's goto parse_class_atom
+    var char_value: i32 = -1  # C's goto normal_char with c
     let c = cur(ps)
     if c == '^':
         ps.p += 1
@@ -397,7 +397,7 @@ func es_parse_quantifier(ps: EsParse*, atom: i32, last_capture_count: i32) -> i3
                 if quant_max < quant_min:
                     return try es_fail(ps, "invalid repetition count")
             else:
-                quant_max = INT32_MAX # infinity
+                quant_max = INT32_MAX  # infinity
         if cur(ps) != '}' and not ps.is_unicode:
             # Annex B: normal atom if invalid '{' syntax
             ps.p = p1

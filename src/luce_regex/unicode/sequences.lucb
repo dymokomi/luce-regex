@@ -146,7 +146,7 @@ func rgi_emoji_zwj_sequences(cb: UnicodeSequencePropCB, opaque: void*?):
                 mod = mod1
                 mod_pos[mod_count] = k
                 mod_count += 1
-                seq[k] = 0 # will be filled later
+                seq[k] = 0  # will be filled later
                 k += 1
             if pres != 0:
                 seq[k] = 0xfe0f

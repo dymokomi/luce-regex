@@ -25,7 +25,7 @@ func parse_group_name(ps: const EsParse*, buf: u8[], len: usize*, pp: usize*) ->
             p += 1
             if ch_at(ps, p) != 'u':
                 return false
-            c = (u32)parse_escape(ps.src, &p, 2) # accept surrogate pairs
+            c = (u32)parse_escape(ps.src, &p, 2)  # accept surrogate pairs
         elif c == (u32)'>':
             break
         elif c >= 128:

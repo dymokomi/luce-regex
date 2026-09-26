@@ -23,7 +23,6 @@
 #
 #==============================================================================================
 
-
 # mark: Versions and limits ====================================================================
 
 # unicode standard version
@@ -148,19 +147,15 @@ pub func lre_is_space_byte(c: u8) -> bool:
 
 ## True if the Latin-1 byte `c` may start a JavaScript identifier.
 pub func lre_is_id_start_byte(c: u8) -> bool:
-    return (lre_ctype_bits[c] & (unicode_c_upper | unicode_c_lower |
-                                 unicode_c_under | unicode_c_dollar)) != 0
+    return (lre_ctype_bits[c] & (unicode_c_upper | unicode_c_lower | unicode_c_under | unicode_c_dollar)) != 0
 
 ## True if the Latin-1 byte `c` may continue a JavaScript identifier.
 pub func lre_is_id_continue_byte(c: u8) -> bool:
-    return (lre_ctype_bits[c] & (unicode_c_upper | unicode_c_lower |
-                                 unicode_c_under | unicode_c_dollar |
-                                 unicode_c_digit)) != 0
+    return (lre_ctype_bits[c] & (unicode_c_upper | unicode_c_lower | unicode_c_under | unicode_c_dollar | unicode_c_digit)) != 0
 
 ## True if the Latin-1 byte `c` is a regexp word character (`\w`).
 pub func lre_is_word_byte(c: u8) -> bool:
-    return (lre_ctype_bits[c] & (unicode_c_upper | unicode_c_lower |
-                                 unicode_c_under | unicode_c_digit)) != 0
+    return (lre_ctype_bits[c] & (unicode_c_upper | unicode_c_lower | unicode_c_under | unicode_c_digit)) != 0
 
 ## True if the code point `c` is a JavaScript white space or line terminator.
 pub func lre_is_space(c: u32) -> bool:

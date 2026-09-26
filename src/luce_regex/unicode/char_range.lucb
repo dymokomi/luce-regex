@@ -46,7 +46,7 @@ pub func cr_copy(cr: CharRange*, cr1: const CharRange*) -> i32:
     if cr_realloc(cr, cr1.len) != 0:
         return -1
     discard(memcpy(nullable_void(cr.points), nullable_const_void(cr1.points),
-                          sizeof(u32) * (usize)cr1.len))
+                   sizeof(u32) * (usize)cr1.len))
     cr.len = cr1.len
     return 0
 
@@ -163,13 +163,9 @@ func mr(run_type: RunType) -> u32:
 #    CASE_F: set char if modified by case folding,
 func unicode_case1(cr: CharRange*, case_mask: i32) -> i32:
     let tab_run_mask: u32[3] = [
-        mr(.u) | mr(.uf) | mr(.ul) | mr(.lsu) | mr(.u2l_399_ext2) | mr(.uf_d20) |
-        mr(.uf_d1_ext) | mr(.u_ext) | mr(.uf_ext2) | mr(.uf_ext3),
-
+        mr(.u) | mr(.uf) | mr(.ul) | mr(.lsu) | mr(.u2l_399_ext2) | mr(.uf_d20) | mr(.uf_d1_ext) | mr(.u_ext) | mr(.uf_ext2) | mr(.uf_ext3),
         mr(.l) | mr(.lf) | mr(.ul) | mr(.lsu) | mr(.u2l_399_ext2) | mr(.lf_ext) | mr(.lf_ext2),
-
-        mr(.uf) | mr(.lf) | mr(.ul) | mr(.lsu) | mr(.u2l_399_ext2) | mr(.lf_ext) | mr(.lf_ext2) |
-        mr(.uf_d20) | mr(.uf_d1_ext) | mr(.lf_ext) | mr(.uf_ext2) | mr(.uf_ext3),
+        mr(.uf) | mr(.lf) | mr(.ul) | mr(.lsu) | mr(.u2l_399_ext2) | mr(.lf_ext) | mr(.lf_ext2) | mr(.uf_d20) | mr(.uf_d1_ext) | mr(.lf_ext) | mr(.uf_ext2) | mr(.uf_ext3),
     ]
     if case_mask == 0:
         return 0
@@ -343,5 +339,4 @@ pub func lre_is_id_start(c: u32) -> bool:
 
 ## True if `c` has the ID_Continue property.
 pub func lre_is_id_continue(c: u32) -> bool:
-    return (lre_is_id_start(c) or
-            lre_is_in_table(c, unicode_prop_ID_Continue1_table, unicode_prop_ID_Continue1_index))
+    return (lre_is_id_start(c) or lre_is_in_table(c, unicode_prop_ID_Continue1_table, unicode_prop_ID_Continue1_index))

@@ -184,8 +184,7 @@ pub func unicode_prop(cr: CharRange*, prop_name: str) -> i32:
             ])
         .alphabetic:
             ret = unicode_prop_ops(cr, [
-                pop_gc, m(unicode_gc_lu) | m(unicode_gc_ll) | m(unicode_gc_lt) | m(unicode_gc_lm) |
-                    m(unicode_gc_lo) | m(unicode_gc_nl),
+                pop_gc, m(unicode_gc_lu) | m(unicode_gc_ll) | m(unicode_gc_lt) | m(unicode_gc_lm) | m(unicode_gc_lo) | m(unicode_gc_nl),
                 pop_prop, prop_arg(.other_uppercase),
                 pop_union,
                 pop_prop, prop_arg(.other_lowercase),
@@ -196,9 +195,7 @@ pub func unicode_prop(cr: CharRange*, prop_name: str) -> i32:
             ])
         .grapheme_base:
             ret = unicode_prop_ops(cr, [
-                pop_gc, m(unicode_gc_cc) | m(unicode_gc_cf) | m(unicode_gc_cs) | m(unicode_gc_co) |
-                    m(unicode_gc_cn) | m(unicode_gc_zl) | m(unicode_gc_zp) | m(unicode_gc_me) |
-                    m(unicode_gc_mn),
+                pop_gc, m(unicode_gc_cc) | m(unicode_gc_cf) | m(unicode_gc_cs) | m(unicode_gc_co) | m(unicode_gc_cn) | m(unicode_gc_zl) | m(unicode_gc_zp) | m(unicode_gc_me) | m(unicode_gc_mn),
                 pop_prop, prop_arg(.other_grapheme_extend),
                 pop_union,
                 pop_invert,
@@ -213,8 +210,7 @@ pub func unicode_prop(cr: CharRange*, prop_name: str) -> i32:
             ])
         .xid_start:
             ret = unicode_prop_ops(cr, [
-                pop_gc, m(unicode_gc_lu) | m(unicode_gc_ll) | m(unicode_gc_lt) | m(unicode_gc_lm) |
-                    m(unicode_gc_lo) | m(unicode_gc_nl),
+                pop_gc, m(unicode_gc_lu) | m(unicode_gc_ll) | m(unicode_gc_lt) | m(unicode_gc_lm) | m(unicode_gc_lo) | m(unicode_gc_nl),
                 pop_prop, prop_arg(.other_id_start),
                 pop_union,
                 pop_prop, prop_arg(.pattern_syntax),
@@ -228,9 +224,7 @@ pub func unicode_prop(cr: CharRange*, prop_name: str) -> i32:
             ])
         .xid_continue:
             ret = unicode_prop_ops(cr, [
-                pop_gc, m(unicode_gc_lu) | m(unicode_gc_ll) | m(unicode_gc_lt) | m(unicode_gc_lm) |
-                    m(unicode_gc_lo) | m(unicode_gc_nl) |
-                    m(unicode_gc_mn) | m(unicode_gc_mc) | m(unicode_gc_nd) | m(unicode_gc_pc),
+                pop_gc, m(unicode_gc_lu) | m(unicode_gc_ll) | m(unicode_gc_lt) | m(unicode_gc_lm) | m(unicode_gc_lo) | m(unicode_gc_nl) | m(unicode_gc_mn) | m(unicode_gc_mc) | m(unicode_gc_nd) | m(unicode_gc_pc),
                 pop_prop, prop_arg(.other_id_start),
                 pop_union,
                 pop_prop, prop_arg(.other_id_continue),
