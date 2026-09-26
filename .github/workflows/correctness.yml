@@ -38,5 +38,6 @@ jobs:
           ln -s "$(command -v clang)" "$RUNNER_TEMP/luce-bin/cc"
           echo "$RUNNER_TEMP/luce-bin" >> "$GITHUB_PATH"
       - run: cd luce-base && ./build.sh
+      - run: echo "$GITHUB_WORKSPACE/luce-base/build" >> "$GITHUB_PATH"
       - run: ./test.sh
         working-directory: luce-regex
