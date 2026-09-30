@@ -170,7 +170,7 @@ test "predicates over every code point":
 
 test "byte classes":
     var h = fnv_offset
-    for b: usize in 0..<256:  # workaround: compiler-issues/untyped-range-is-i64
+    for b: usize in 0..<256:
         let c = (u8)b
         h = mix(h, (u32)lre_is_id_start_byte(c))
         h = mix(h, (u32)lre_is_id_continue_byte(c))
@@ -383,7 +383,7 @@ test "scripts with and without extensions":
     assert((usize)n * 14 == rows.length)
     for j: i32 in 0..<n:
         let name = first_alias(unicode_script_name_table, j)
-        for ext: usize in 0..<2:  # workaround: compiler-issues/untyped-range-is-i64
+        for ext: usize in 0..<2:
             let at = (usize)j * 14 + ext * 7
             var cr: CharRange
             cr_init(&cr, none, none)

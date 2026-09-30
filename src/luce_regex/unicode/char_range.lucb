@@ -28,14 +28,14 @@ pub func cr_init(cr: CharRange*, mem_opaque: void*?, realloc_func: ReallocFunc?)
 ## Release the storage of `cr`.
 pub func cr_free(cr: CharRange*):
     let realloc_func = cr.realloc_func else trap("cr_free: cr_init was not called")
-    discard(realloc_func(cr.mem_opaque, nullable_void(cr.points), 0))
+    discard(realloc_func(cr.mem_opaque, cr.points, 0))
 
 ## Make room for `size` points (growing by at least half); 0, or -1 when it cannot grow.
 pub func cr_realloc(cr: CharRange*, size: i32) -> i32:
     if size > cr.size:
         let new_size = max_int(size, cr.size * 3 // 2)
         let realloc_func = cr.realloc_func else trap("cr_realloc: cr_init was not called")
-        let new_buf = realloc_func(cr.mem_opaque, nullable_void(cr.points),
+        let new_buf = realloc_func(cr.mem_opaque, cr.points,
                                    (usize)new_size * sizeof(u32)) else return -1
         cr.points = (u32*)new_buf
         cr.size = new_size
@@ -45,7 +45,7 @@ pub func cr_realloc(cr: CharRange*, size: i32) -> i32:
 pub func cr_copy(cr: CharRange*, cr1: const CharRange*) -> i32:
     if cr_realloc(cr, cr1.len) != 0:
         return -1
-    discard(memcpy(nullable_void(cr.points), nullable_const_void(cr1.points),
+    discard(memcpy(cr.points, cr1.points,
                    sizeof(u32) * (usize)cr1.len))
     cr.len = cr1.len
     return 0

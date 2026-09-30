@@ -180,18 +180,3 @@ pub func lre_js_is_ident_next(c: u32) -> bool:
         if c >= 0x200C and c <= 0x200D:
             return true
         return lre_is_id_continue(c)
-
-# mark: Pointer helpers ========================================================================
-
-# A nullable typed pointer does not convert to `void*?`, implicitly or by a cast.
-# workaround: compiler-issues/nullable_pointer_cast (reported by the cutils port)
-func nullable_void(p: u32*?) -> void*?:
-    if let q = p:
-        return q
-    return none
-
-# The same for a read-only source pointer (`void*?` does not convert to `const void*?`).
-func nullable_const_void(p: u32*?) -> const void*?:
-    if let q = p:
-        return q
-    return none
