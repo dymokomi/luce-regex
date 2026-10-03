@@ -25,7 +25,7 @@
 #==============================================================================================
 
 import memory
-import luce_std.utf8
+from luce_std import utf8
 import interop
 import unicode
 
