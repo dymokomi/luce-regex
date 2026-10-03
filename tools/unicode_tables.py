@@ -3,7 +3,7 @@
 
 usage: tools/unicode_tables.py QUICKJS_SOURCE_DIR
 
-Writes five fragments into src/luce_regex/unicode/, one per section of libunicode-table.h:
+Writes five fragments into src/unicode/, one per section of libunicode-table.h:
 case_table.lucb, normalization_table.lucb, category_table.lucb, script_table.lucb and
 property_table.lucb.
 
@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-UNICODE = ROOT / "src/luce_regex/unicode"
+UNICODE = ROOT / "src/unicode"
 RESERVED = set("""alloc and as asm break catch const continue defer elif else enum errdefer
 export extern false for free from func goto if import in interface let local match mutating
 new none not or pub recover return self static struct test true try type union var volatile

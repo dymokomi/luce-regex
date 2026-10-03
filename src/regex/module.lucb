@@ -25,9 +25,9 @@
 #==============================================================================================
 
 import memory
-import utf8
+import luce_std.utf8
 import interop
-import luce_regex.unicode as unicode
+import unicode
 
 ## A pattern the engine could not parse.
 pub let syntax_error: ErrorCode = ErrorCode.package(330)
