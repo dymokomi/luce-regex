@@ -267,7 +267,7 @@ pub struct Regex:
     pub func close():
         regex_dispose(&self)
 
-    func own(native: Regex*) -> interop.Reference[Regex]!:
+    static func own(native: Regex*) -> interop.Reference[Regex]!:
         return try interop.Reference[Regex].adopt(native, regex_type)
 
 ## The interop type of a compiled `Regex`.
