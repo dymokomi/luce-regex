@@ -95,7 +95,7 @@ func parse_captures(ps: const EsParse*, has_named: i32*, name: const u8[]?, list
                         if parse_group_name(ps, buf, &len, &p):
                             if same_name(buf[0..<len], wanted):
                                 if let l = list:
-                                    discard(try l.push(capture_index))
+                                    _ = try l.push(capture_index)
                                 n += 1
                     capture_index += 1
                     if capture_index >= CAPTURE_COUNT_MAX:
@@ -126,7 +126,7 @@ func count_captures(ps: EsParse*) -> i32!:
 
 func has_named_captures(ps: EsParse*) -> bool!:
     if ps.has_named_captures < 0:
-        discard(try count_captures(ps))
+        _ = try count_captures(ps)
     return ps.has_named_captures != 0
 
 # The groups already defined with the name `name`, appended to `list` when given; the count.
@@ -141,7 +141,7 @@ func find_group_name(ps: const EsParse*, name: const u8[], list: Vec[i32]*?) -> 
             len += 1
         if same_name(names[p..<p + len], name):
             if let l = list:
-                discard(try l.push(capture_index))
+                _ = try l.push(capture_index)
             n += 1
         p += len + 2
         capture_index += 1

@@ -30,7 +30,7 @@ enum RunType as u32:
 
 func lre_case_conv1(c: u32, conv_type: i32) -> u32:
     var res: u32[3]
-    discard(lre_case_conv(res, c, conv_type))
+    _ = lre_case_conv(res, c, conv_type)
     return res[0]
 
 # mark: Case conversion ========================================================================

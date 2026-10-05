@@ -209,7 +209,7 @@ func unicode_compose_pair(c0: u32, c1: u32) -> i32:
         let len = (v >> (32 - 18 - 7)) & 0x7f
         let decomp_type = (v >> (32 - 18 - 7 - 6)) & 0x3f
         let ch = code + d_offset
-        discard(unicode_decomp_entry(pair, ch, (i32)d_idx, code, len, decomp_type))
+        _ = unicode_decomp_entry(pair, ch, (i32)d_idx, code, len, decomp_type)
         var d = (i32)(c0 -% pair[0])
         if d == 0:
             d = (i32)(c1 -% pair[1])
@@ -306,17 +306,17 @@ func to_nfd_rec(dbuf: DynBuf*, src: const u32[], is_compat: bool):
         if c >= 0xac00 and c < 0xd7a4:
             # Hangul decomposition
             c -= 0xac00
-            discard(dbuf_put_u32(dbuf, 0x1100 + c // 588))
-            discard(dbuf_put_u32(dbuf, 0x1161 + (c % 588) // 28))
+            _ = dbuf_put_u32(dbuf, 0x1100 + c // 588)
+            _ = dbuf_put_u32(dbuf, 0x1161 + (c % 588) // 28)
             let v = c % 28
             if v != 0:
-                discard(dbuf_put_u32(dbuf, 0x11a7 + v))
+                _ = dbuf_put_u32(dbuf, 0x11a7 + v)
         else:
             let l = unicode_decomp_char(res, c, is_compat)
             if l != 0:
                 to_nfd_rec(dbuf, res[0..<(usize)l], is_compat)
             else:
-                discard(dbuf_put_u32(dbuf, c))
+                _ = dbuf_put_u32(dbuf, c)
 
 # return 0 if not found
 func compose_pair(c0: u32, c1: u32) -> i32:
@@ -352,7 +352,7 @@ pub func unicode_normalize(pdst: u32*?*, src: const u32[], n_type: UnicodeNormal
     var dbuf_s: DynBuf
     let dbuf = &dbuf_s
     dbuf_init2(dbuf, opaque, realloc_func)
-    if dbuf_claim(dbuf, sizeof(u32) * src_len) != 0:
+    if dbuf_claim(dbuf, memory.size_of(u32) * src_len) != 0:
         *pdst = none
         return -1
 
@@ -366,7 +366,7 @@ pub func unicode_normalize(pdst: u32*?*, src: const u32[], n_type: UnicodeNormal
         if latin1:
             if src_len != 0:
                 let b = dbuf.buf else trap("unicode_normalize: no storage")
-                discard(memcpy(b, src.data, src_len * sizeof(u32)))
+                _ = memcpy(b, src.data, src_len * memory.size_of(u32))
             *pdst = dbuf_result(dbuf)
             return (i32)src_len
 
@@ -374,7 +374,7 @@ pub func unicode_normalize(pdst: u32*?*, src: const u32[], n_type: UnicodeNormal
     if dbuf_error(dbuf):
         *pdst = none
         return -1
-    let buf_len = dbuf.size // sizeof(u32)
+    let buf_len = dbuf.size // memory.size_of(u32)
     let buf = dbuf_u32(dbuf, buf_len)
 
     sort_cc(buf)

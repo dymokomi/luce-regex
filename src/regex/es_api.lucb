@@ -126,7 +126,7 @@ pub func compile_ecmascript(pattern: const u8[], flags: i32, message: u8[], host
             heap.realloc_func = rf
         check_stack = h.check_stack_overflow
     let rf = heap.realloc_func else trap("unreachable")
-    let mem = rf(heap.opaque, none, sizeof(Regex))
+    let mem = rf(heap.opaque, none, memory.size_of(Regex))
     if mem == none:
         copy_message(message, "out of memory".bytes)
         return none
@@ -158,7 +158,7 @@ pub func compile_ecmascript(pattern: const u8[], flags: i32, message: u8[], host
 ## CESU-8 without, as QuickJS encodes it.
 pub func compile_ecmascript16(pattern: const u16[], flags: i32, message: u8[], host: const Host*?) -> Regex*?:
     let pairs = (flags & (es_unicode | es_unicode_sets)) != 0
-    let bytes = alloc u8[pattern.length * 3 + 1] in memory.heap catch failure:
+    let bytes = new u8[pattern.length * 3 + 1] --- in memory.heap catch failure:
         copy_message(message, "out of memory".bytes)
         return none
     defer free(bytes) in memory.heap
@@ -179,14 +179,14 @@ func es_build(ps: EsParse*, flags: i32) -> !:
     re.unicode = ps.is_unicode
     let root = try es_parse_disjunction(ps)
     if cur(ps) != 0:
-        discard(try es_fail(ps, "extraneous characters at the end"))
+        _ = try es_fail(ps, "extraneous characters at the end")
     re.ncap = ps.capture_count
     re.reg_depth = 0
     try es_compile(re, root, &re.code, false)
-    discard(try re.code.push(Inst(op = OP_MATCH)))
+    _ = try re.code.push(Inst(op = OP_MATCH))
     re.nregs = es_register_count(re)
     if re.nregs > REGISTER_COUNT_MAX:
-        discard(try es_fail(ps, "too many imbricated quantifiers"))
+        _ = try es_fail(ps, "too many imbricated quantifiers")
     # named groups are present when some name is not empty
     if re.group_names.used > (usize)((re.ncap - 1) * 2):
         re.es_flags |= es_named_groups
@@ -203,7 +203,7 @@ pub func free_ecmascript(re: Regex*):
     regex_dispose(re)
     let heap = re.heap
     let rf = heap.realloc_func else trap("free_ecmascript: not an ECMAScript program")
-    discard(rf(heap.opaque, re, 0))
+    _ = rf(heap.opaque, re, 0)
 
 # mark: Describing =============================================================================
 
@@ -323,7 +323,7 @@ func es_compute_first(re: Regex*) -> !:
         i += 1
     var stack = Vec[i32](heap = re.heap)
     defer stack.free_all()
-    discard(try stack.push(0))
+    _ = try stack.push(0)
     while stack.used > 0:
         let pc = stack.data[stack.used - 1]
         stack.used -= 1
@@ -333,20 +333,20 @@ func es_compute_first(re: Regex*) -> !:
         let inst = re.code.data[(usize)pc]
         let op = inst.op
         if op == OP_SAVE or op == OP_ASSERT or op == OP_SET_REG or op == OP_SET_POS or op == OP_SAVE_RESET:
-            discard(try stack.push(pc + 1))
+            _ = try stack.push(pc + 1)
         elif op == OP_JMP:
-            discard(try stack.push(inst.x))
+            _ = try stack.push(inst.x)
         elif op == OP_SPLIT:
-            discard(try stack.push(inst.x))
-            discard(try stack.push(inst.y))
+            _ = try stack.push(inst.x)
+            _ = try stack.push(inst.y)
         elif op == OP_CHAR:
-            discard(try re.first_chars.push(inst.ch))
+            _ = try re.first_chars.push(inst.ch)
         elif op == OP_CHAR_I:
-            discard(try re.first_chars_i.push(inst.ch))
+            _ = try re.first_chars_i.push(inst.ch)
         elif op == OP_RANGE:
-            discard(try re.first_classes.push(inst.x))
+            _ = try re.first_classes.push(inst.x)
         elif op == OP_RANGE_I:
-            discard(try re.first_classes.push(-1 - inst.x))
+            _ = try re.first_classes.push(-1 - inst.x)
         else:
             re.first_any = true
             return

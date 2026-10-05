@@ -27,13 +27,13 @@ func emit(out: Vec[Inst]*, op: u8, x: i32, y: i32) -> usize!:
 
 func es_char_op(out: Vec[Inst]*, op: u8, x: i32, ch: u32, backward: bool) -> !:
     if backward:
-        discard(try emit(out, OP_PREV, 0, 0))
+        _ = try emit(out, OP_PREV, 0, 0)
     var inst = Inst(op = op)
     inst.x = x
     inst.ch = ch
-    discard(try out.push(inst))
+    _ = try out.push(inst)
     if backward:
-        discard(try emit(out, OP_PREV, 0, 0))
+        _ = try emit(out, OP_PREV, 0, 0)
 
 func es_compile(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
     let node = re.nodes.data[(usize)ni]
@@ -46,7 +46,7 @@ func es_compile(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
     elif kind == K_CLASS:
         try es_char_op(out, OP_RANGE_I if ic else OP_RANGE, node.a, 0, backward)
     elif kind == K_ANCHOR:
-        discard(try emit(out, OP_ASSERT, node.a, 0))
+        _ = try emit(out, OP_ASSERT, node.a, 0)
     elif kind == K_CONCAT:
         if not backward:
             var child = node.first_child
@@ -59,7 +59,7 @@ func es_compile(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
             defer children.free_all()
             var child = node.first_child
             while child != -1:
-                discard(try children.push(child))
+                _ = try children.push(child)
                 child = re.nodes.data[(usize)child].next_sibling
             var k = children.used
             while k > 0:
@@ -73,9 +73,9 @@ func es_compile(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
         else:
             let first = 2 * node.a + (1 if backward else 0)
             let second = 2 * node.a + (0 if backward else 1)
-            discard(try emit(out, OP_SAVE, first, 0))
+            _ = try emit(out, OP_SAVE, first, 0)
             try es_compile(re, node.first_child, out, backward)
-            discard(try emit(out, OP_SAVE, second, 0))
+            _ = try emit(out, OP_SAVE, second, 0)
     elif kind == K_REPEAT:
         try es_compile_repeat(re, ni, out, backward)
     elif kind == K_BACKREF:
@@ -83,12 +83,12 @@ func es_compile(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
         inst.x = node.x
         inst.y = node.y
         inst.ch = (1 if ic else 0) | (2 if backward else 0)
-        discard(try out.push(inst))
+        _ = try out.push(inst)
     elif kind == K_LOOK:
         let start = try emit(out, OP_LOOK_START, 0, 0)
         out.data[start].negate = node.negate
         try es_compile(re, node.first_child, out, not node.ahead)
-        discard(try emit(out, OP_NLOOK_MATCH if node.negate else OP_LOOK_MATCH, 0, 0))
+        _ = try emit(out, OP_NLOOK_MATCH if node.negate else OP_LOOK_MATCH, 0, 0)
         out.data[start].x = (i32)out.used
 
 # K_EMPTY emits nothing.
@@ -105,7 +105,7 @@ func es_compile_alt(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> !:
             out.data[si].x = (i32)out.used
             try es_compile(re, child, out, backward)
             let ji = try emit(out, OP_JMP, 0, 0)
-            discard(try jumps.push((i32)ji))
+            _ = try jumps.push((i32)ji)
             out.data[si].y = (i32)out.used
         else:
             try es_compile(re, child, out, backward)
@@ -138,7 +138,7 @@ func append_code(out: Vec[Inst]*, body: const Vec[Inst]*, reg_delta: i32) -> !:
             inst.y += off
         if is_reg_op(op):
             inst.x += reg_delta
-        discard(try out.push(inst))
+        _ = try out.push(inst)
         i += 1
 
 # re_need_check_adv_and_capture_init: whether an iteration of the atom may match nothing
@@ -186,44 +186,44 @@ func es_compile_repeat(re: Regex*, ni: i32, out: Vec[Inst]*, backward: bool) -> 
     if quant_min == 0:
         # reset the captures once in case the atom is not executed
         if not need_capture_init and has_caps:
-            discard(try emit(out, OP_SAVE_RESET, node.x, node.y - 1))
+            _ = try emit(out, OP_SAVE_RESET, node.x, node.y - 1)
         if quant_max == 0:
             return
         if quant_max == 1 or quant_max == INT32_MAX:
             let split_at = try emit(out, OP_SPLIT, 0, 0)
             let body_start = (i32)out.used
             if check:
-                discard(try emit(out, OP_SET_POS, reg0, 0))
+                _ = try emit(out, OP_SET_POS, reg0, 0)
             if reset_inside:
-                discard(try emit(out, OP_SAVE_RESET, node.x, node.y - 1))
+                _ = try emit(out, OP_SAVE_RESET, node.x, node.y - 1)
             try append_code(out, &body, (1 if check else 0) - 2)
             if check:
-                discard(try emit(out, OP_CHECK_ADV, reg0, 0))
+                _ = try emit(out, OP_CHECK_ADV, reg0, 0)
             if quant_max == INT32_MAX:
-                discard(try emit(out, OP_JMP, (i32)split_at, 0))
+                _ = try emit(out, OP_JMP, (i32)split_at, 0)
             try patch_split(out, split_at, body_start, (i32)out.used, greedy)
         else:
             let split_at = try emit(out, OP_SPLIT, 0, 0)
             let next = (i32)out.used
-            discard(try emit(out, OP_SET_REG, reg0, quant_max))
+            _ = try emit(out, OP_SET_REG, reg0, quant_max)
             let loop_top = try emit_counted_body(out, &body, reg0, check, reset_inside, node)
             try emit_loop_split(out, reg0, loop_top, quant_max, greedy, check)
             try patch_split(out, split_at, next, (i32)out.used, greedy)
     elif quant_min == 1 and quant_max == INT32_MAX and not check:
         let top = (i32)out.used
         if reset_inside:
-            discard(try emit(out, OP_SAVE_RESET, node.x, node.y - 1))
+            _ = try emit(out, OP_SAVE_RESET, node.x, node.y - 1)
         try append_code(out, &body, -2)
         let split_at = try emit(out, OP_SPLIT, 0, 0)
         try patch_split(out, split_at, top, (i32)out.used, greedy)
     else:
         if quant_min == quant_max:
             check = false
-        discard(try emit(out, OP_SET_REG, reg0, quant_max))
+        _ = try emit(out, OP_SET_REG, reg0, quant_max)
         let loop_top = try emit_counted_body(out, &body, reg0, check, reset_inside, node)
         if quant_min == quant_max:
             # a simple loop is enough
-            discard(try emit(out, OP_LOOP, reg0, loop_top))
+            _ = try emit(out, OP_LOOP, reg0, loop_top)
         else:
             try emit_loop_split(out, reg0, loop_top, quant_max - quant_min, greedy, check)
 
@@ -233,9 +233,9 @@ func emit_counted_body(out: Vec[Inst]*, body: const Vec[Inst]*, reg0: i32, check
                        reset_inside: bool, node: Node) -> i32!:
     let loop_top = (i32)out.used
     if check:
-        discard(try emit(out, OP_SET_POS, reg0 + 1, 0))
+        _ = try emit(out, OP_SET_POS, reg0 + 1, 0)
     if reset_inside:
-        discard(try emit(out, OP_SAVE_RESET, node.x, node.y - 1))
+        _ = try emit(out, OP_SAVE_RESET, node.x, node.y - 1)
     try append_code(out, body, (2 if check else 1) - 2)
     return loop_top
 

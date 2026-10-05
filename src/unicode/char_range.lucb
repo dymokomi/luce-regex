@@ -13,6 +13,8 @@
 
 # character range
 
+import memory
+
 func cr_default_realloc(opaque: void*?, ptr: void*?, size: usize) -> void*?:
     return c_realloc(ptr, size)
 
@@ -28,7 +30,7 @@ pub func cr_init(cr: CharRange*, mem_opaque: void*?, realloc_func: ReallocFunc?)
 ## Release the storage of `cr`.
 pub func cr_free(cr: CharRange*):
     let realloc_func = cr.realloc_func else trap("cr_free: cr_init was not called")
-    discard(realloc_func(cr.mem_opaque, cr.points, 0))
+    _ = realloc_func(cr.mem_opaque, cr.points, 0)
 
 ## Make room for `size` points (growing by at least half); 0, or -1 when it cannot grow.
 pub func cr_realloc(cr: CharRange*, size: i32) -> i32:
@@ -36,7 +38,7 @@ pub func cr_realloc(cr: CharRange*, size: i32) -> i32:
         let new_size = max_int(size, cr.size * 3 // 2)
         let realloc_func = cr.realloc_func else trap("cr_realloc: cr_init was not called")
         let new_buf = realloc_func(cr.mem_opaque, cr.points,
-                                   (usize)new_size * sizeof(u32)) else return -1
+                                   (usize)new_size * memory.size_of(u32)) else return -1
         cr.points = (u32*)new_buf
         cr.size = new_size
     return 0
@@ -45,8 +47,8 @@ pub func cr_realloc(cr: CharRange*, size: i32) -> i32:
 pub func cr_copy(cr: CharRange*, cr1: const CharRange*) -> i32:
     if cr_realloc(cr, cr1.len) != 0:
         return -1
-    discard(memcpy(cr.points, cr1.points,
-                   sizeof(u32) * (usize)cr1.len))
+    _ = memcpy(cr.points, cr1.points,
+               memory.size_of(u32) * (usize)cr1.len)
     cr.len = cr1.len
     return 0
 
@@ -141,7 +143,7 @@ pub func cr_invert(cr: CharRange*) -> i32:
     if cr_realloc(cr, len + 2) != 0:
         return -1
     let points = cr.points else trap("cr_invert: no storage")
-    discard(memmove(points + 1, points, (usize)len * sizeof(u32)))
+    _ = memmove(points + 1, points, (usize)len * memory.size_of(u32))
     points[0] = 0
     points[(usize)len + 1] = 0xffffffff
     cr.len = len + 2
@@ -313,7 +315,7 @@ pub func cr_regexp_canonicalize(cr: CharRange*, is_unicode: bool) -> i32:
             elif d_end == d:
                 d_end += 1
             else:
-                discard(cr_add_interval(&cr_result, d_start, d_end))
+                _ = cr_add_interval(&cr_result, d_start, d_end)
                 d_start = d
                 d_end = d + 1
             c += 1

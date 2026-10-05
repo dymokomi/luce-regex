@@ -19,11 +19,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 UNICODE = ROOT / "src/unicode"
-RESERVED = set("""alloc and as asm break catch const continue defer elif else enum errdefer
-export extern false for free from func goto if import in interface let local match mutating
-new none not or pub recover return self static struct test true try type union var volatile
-while with assert discard error trap hash print format sizeof alignof offsetof hex bin pad
-bool char str unit never void fmt""".split())
+RESERVED = set("""and as asm break catch const continue defer elif else enum errdefer
+extern false for free from func if import in interface let match new none not or pub
+recover return self struct test true try type union var volatile while with
+assert error trap print bool char str unit never void fmt""".split())
 
 # (fragment, summary, first declaration of the section in libunicode-table.h)
 SECTIONS = [

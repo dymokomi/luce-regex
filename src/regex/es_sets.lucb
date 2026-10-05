@@ -103,7 +103,7 @@ func set_add_string(s: StrSet*, cps: const u32[]) -> !:
         try set_rehash(s, s.offs.used + 1)
     let off = try s.pool.push((u32)cps.length)
     for c in cps:
-        discard(try s.pool.push(c))
+        _ = try s.pool.push(c)
     let index = try s.offs.push((i32)off)
     s.table.data[set_bucket(s, cps)] = (i32)index
 
@@ -161,7 +161,7 @@ func set_canonicalize(ps: const EsParse*, s: StrSet*, is_unicode: bool) -> !:
         let cps = set_string(&old, i)
         buf.used = 0
         for c in cps:
-            discard(try buf.push((u32)unicode.lre_canonicalize(c, is_unicode)))
+            _ = try buf.push((u32)unicode.lre_canonicalize(c, is_unicode))
         try set_add(s, buf.data[..<buf.used])
         i += 1
 
@@ -228,8 +228,8 @@ func es_new_class(re: Regex*, cr: const unicode.CharRange*) -> i32!:
     cc.range_start = re.ranges.used
     var i: usize = 0
     while i + 1 < points.length:
-        discard(try re.ranges.push(points[i]))
-        discard(try re.ranges.push(points[i + 1] - 1))
+        _ = try re.ranges.push(points[i])
+        _ = try re.ranges.push(points[i + 1] - 1)
         i += 2
     cc.range_count = points.length // 2
     let index = try re.classes.push(cc)

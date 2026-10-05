@@ -24,15 +24,15 @@ func onig_build(re: Regex*, pattern: str, ignore_case: bool) -> !:
         error(syntax_error, "trailing characters in pattern")
     re.ncap = re.ngroups + 1
     let ncap = (usize)(2 * re.ncap)
-    re.caps = try alloc i32[ncap] in memory.heap
+    re.caps = try new i32[ncap] --- in memory.heap
     var i: usize = 0
     while i < ncap:
         re.caps[i] = -1
         i += 1
     try compile_node(re, root, &re.code)
-    discard(try re.code.push(Inst(op = OP_MATCH)))
+    _ = try re.code.push(Inst(op = OP_MATCH))
     if re.mark_count > 0:
-        re.marks = try alloc i32[(usize)re.mark_count] in memory.heap
+        re.marks = try new i32[(usize)re.mark_count] --- in memory.heap
         var m: usize = 0
         while m < (usize)re.mark_count:
             re.marks[m] = 0
@@ -251,7 +251,7 @@ func onig_grouped(re: Regex*, index: i32) -> i32!:
 func onig_parse_named(re: Regex*, name: Span) -> i32!:
     re.ngroups += 1
     let index = re.ngroups
-    discard(try re.names.push(NameEntry(start = name.start, len = name.len, group = index)))
+    _ = try re.names.push(NameEntry(start = name.start, len = name.len, group = index))
     return try onig_grouped(re, index)
 
 func onig_parse_look(re: Regex*, ahead: bool, negate: bool) -> i32!:
@@ -443,7 +443,7 @@ func onig_parse_posix(re: Regex*, ci: i32) -> !:
     let start = (i32)re.name_cps.used
     var len: i32 = 0
     while re.pp < re.pat.used and re.pat.data[re.pp] != (u32)':':
-        discard(try re.name_cps.push(re.pat.data[re.pp]))
+        _ = try re.name_cps.push(re.pat.data[re.pp])
         len += 1
         re.pp += 1
     if re.pp < re.pat.used:
@@ -458,13 +458,13 @@ func onig_read_property(re: Regex*) -> Span!:
     if re.pp < re.pat.used and re.pat.data[re.pp] == (u32)'{':
         re.pp += 1
         while re.pp < re.pat.used and re.pat.data[re.pp] != (u32)'}':
-            discard(try re.name_cps.push(re.pat.data[re.pp]))
+            _ = try re.name_cps.push(re.pat.data[re.pp])
             len += 1
             re.pp += 1
         if re.pp < re.pat.used:
             re.pp += 1
     elif re.pp < re.pat.used:
-        discard(try re.name_cps.push(re.pat.data[re.pp]))
+        _ = try re.name_cps.push(re.pat.data[re.pp])
         len += 1
         re.pp += 1
     return Span(start = start, len = len)
@@ -510,8 +510,8 @@ func onig_add_builtin(re: Regex*, ci: i32, bit: u32):
     re.classes.data[(usize)ci].builtins = re.classes.data[(usize)ci].builtins | bit
 
 func add_range(re: Regex*, ci: i32, lo: u32, hi: u32) -> !:
-    discard(try re.ranges.push(lo))
-    discard(try re.ranges.push(hi))
+    _ = try re.ranges.push(lo)
+    _ = try re.ranges.push(hi)
     re.classes.data[(usize)ci].range_count += 1
 
 func class_node(re: Regex*, ci: i32) -> i32!:
@@ -523,7 +523,7 @@ func onig_read_name(re: Regex*, term: u32) -> Span!:
     let start = (i32)re.name_cps.used
     var len: i32 = 0
     while re.pp < re.pat.used and re.pat.data[re.pp] != term:
-        discard(try re.name_cps.push(re.pat.data[re.pp]))
+        _ = try re.name_cps.push(re.pat.data[re.pp])
         len += 1
         re.pp += 1
     try onig_expect(re, term)

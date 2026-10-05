@@ -74,7 +74,7 @@ struct Stacks:
     var log_slot: Vec[i32]
     var log_val: Vec[i32]
 
-    mutating func free_all():
+    func free_all():
         self.bt_pc.free_all()
         self.bt_sp.free_all()
         self.bt_log.free_all()
@@ -200,16 +200,16 @@ pub struct Regex:
 
     ## The leftmost match at or after `offset` over `subject` (a codepoint array), or false.
     ## `anchor` is the position `\G` asserts. Sets the last-match state on success.
-    pub mutating func search(subject: const u32[], offset: i32, anchor: i32) -> bool:
+    pub func search(subject: const u32[], offset: i32, anchor: i32) -> bool:
         return onig_search(&self, subject, offset, anchor)
 
     ## A match anchored exactly at `pos` (no scanning), or false.
-    pub mutating func match_at(subject: const u32[], pos: i32, anchor: i32) -> bool:
+    pub func match_at(subject: const u32[], pos: i32, anchor: i32) -> bool:
         return onig_match_at(&self, subject, pos, anchor)
 
     ## The leftmost match at or after codepoint `offset` in `text`, or false. Convenience for
     ## `str` callers; decodes into a reused buffer.
-    pub mutating func find(text: str, offset: i32, anchor: i32) -> bool:
+    pub func find(text: str, offset: i32, anchor: i32) -> bool:
         self.text_subj.used = 0
         decode_subj(text, &self.text_subj) catch failure:
             return false
@@ -264,10 +264,10 @@ pub struct Regex:
 
     ## Release every allocation the pattern holds. (An ECMAScript program is released with
     ## `free_ecmascript`, which also frees the `Regex` itself.)
-    pub mutating func close():
+    pub func close():
         regex_dispose(&self)
 
-    static func own(native: Regex*) -> interop.Reference[Regex]!:
+    func own(native: Regex*) -> interop.Reference[Regex]!:
         return try interop.Reference[Regex].adopt(native, regex_type)
 
 ## The interop type of a compiled `Regex`.
@@ -320,8 +320,8 @@ pub func decode_subj(text: str, out: Vec[u32]*) -> !:
     var offset: usize = 0
     while offset < bytes.length:
         if let decoded = utf8.decode(bytes, offset):
-            discard(try out.push((u32)decoded.scalar))
+            _ = try out.push((u32)decoded.scalar)
             offset += decoded.width
         else:
-            discard(try out.push((u32)bytes[offset]))
+            _ = try out.push((u32)bytes[offset])
             offset += 1

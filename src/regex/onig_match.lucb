@@ -61,7 +61,7 @@ func onig_run_look[S: Units](re: Regex*, src: const S*, inst: Inst, sp: i32) -> 
     var snap = Vec[i32]()
     var s: usize = 0
     while s < re.caps.length:
-        discard(snap.push(re.caps[s]) catch failure: trap("out of memory in regex vm"))
+        _ = snap.push(re.caps[s]) catch failure: trap("out of memory in regex vm")
         s += 1
     var st = stacks_on(Heap())
     var ok = false

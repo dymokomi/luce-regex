@@ -133,15 +133,15 @@ struct Heap:
 
 func heap_alloc[T](h: const Heap*, count: usize) -> T[]!:
     if let rf = h.realloc_func:
-        let p = rf(h.opaque, none, count * sizeof(T)) else error(memory.exhausted, "regex: out of memory")
+        let p = rf(h.opaque, none, count * memory.size_of(T)) else error(memory.exhausted, "regex: out of memory")
         return T[]((T*)p, count)
-    return try alloc T[count] in memory.heap
+    return try new T[count] --- in memory.heap
 
 func heap_free[T](h: const Heap*, data: T[]):
     if data.length == 0:
         return
     if let rf = h.realloc_func:
-        discard(rf(h.opaque, data.data, 0))
+        _ = rf(h.opaque, data.data, 0)
     else:
         free(data) in memory.heap
 
@@ -161,7 +161,7 @@ struct Vec[T]:
     var used: usize = 0
     var heap: Heap
 
-    mutating func ensure(count: usize) -> !:
+    func ensure(count: usize) -> !:
         if count <= self.data.length:
             return
         var capacity: usize = 8 if self.data.length == 0 else self.data.length * 2
@@ -175,14 +175,14 @@ struct Vec[T]:
         heap_free[T](&self.heap, self.data)
         self.data = grown
 
-    mutating func push(value: T) -> usize!:
+    func push(value: T) -> usize!:
         try self.ensure(self.used + 1)
         self.data[self.used] = value
         self.used += 1
         return self.used - 1
 
     ## Set index `i`, growing by one when `i` is at the end; false when memory runs out.
-    mutating func put(i: usize, value: T) -> bool:
+    func put(i: usize, value: T) -> bool:
         if i < self.used:
             self.data[i] = value
             return true
@@ -192,7 +192,7 @@ struct Vec[T]:
         self.used = i + 1
         return true
 
-    mutating func free_all():
+    func free_all():
         heap_free[T](&self.heap, self.data)
         var empty: T[]
         self.data = empty

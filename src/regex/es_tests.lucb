@@ -79,13 +79,13 @@ func test_host(mode: i32) -> Host:
 struct Text:
     var bytes: Vec[u8]
 
-    mutating func add(s: const u8[]):
+    func add(s: const u8[]):
         for b in s:
-            discard(self.bytes.push(b) catch failure: trap("out of memory"))
+            _ = self.bytes.push(b) catch failure: trap("out of memory")
 
-    mutating func add_int(v: i32):
+    func add_int(v: i32):
         var buf: u8[16]
-        let t = format(buf, f"{v}") catch failure:
+        let t = strings.format(buf, f"{v}") catch failure:
             recover "?"
         self.add(t.bytes)
 
@@ -148,10 +148,10 @@ func decode_units(subject: str, out: Vec[u16]*):
             var v: u32 = 0
             for k: usize in 1..=4:
                 v = (v << 4) | hex_value(b[i + k])
-            discard(out.push((u16)v) catch failure: trap("out of memory"))
+            _ = out.push((u16)v) catch failure: trap("out of memory")
             i += 5
         else:
-            discard(out.push((u16)b[i]) catch failure: trap("out of memory"))
+            _ = out.push((u16)b[i]) catch failure: trap("out of memory")
             i += 1
 
 # mark: Known deviations =======================================================================
@@ -215,9 +215,9 @@ func check_exec(c: const ExecCase*) -> bool:
     var bytes = Vec[u8]()
     defer bytes.free_all()
     for u in units.data[..<units.used]:
-        discard(bytes.push((u8)u) catch failure: trap("out of memory"))
+        _ = bytes.push((u8)u) catch failure: trap("out of memory")
     let cc = capture_count(re)
-    let captures = alloc i32[(usize)(2 * cc)] in memory.heap catch failure: trap("out of memory")
+    let captures = new i32[(usize)(2 * cc)] --- in memory.heap catch failure: trap("out of memory")
     defer free(captures) in memory.heap
     let host = test_host(c.mode)
     var ret: i32 = 0
@@ -274,7 +274,7 @@ test "parse_escape":
         var pos: usize = 0
         let ret = parse_escape(c.text.bytes, &pos, c.allow_utf16)
         var buf: u8[32]
-        let got = format(buf, f"{ret} {pos}") catch failure:
+        let got = strings.format(buf, f"{ret} {pos}") catch failure:
             recover "?"
         if got != c.expect:
             print(f"escape \"{c.text}\" {c.allow_utf16}: got {got}, expect {c.expect}")
@@ -300,10 +300,10 @@ func units16(text: str, out: Vec[u16]*):
     for ch in text:
         let c = (u32)ch
         if c > 0xFFFF:
-            discard(out.push((u16)(0xD800 + ((c - 0x10000) >> 10))) catch failure: trap("oom"))
-            discard(out.push((u16)(0xDC00 + ((c - 0x10000) & 0x3FF))) catch failure: trap("oom"))
+            _ = out.push((u16)(0xD800 + ((c - 0x10000) >> 10))) catch failure: trap("oom")
+            _ = out.push((u16)(0xDC00 + ((c - 0x10000) & 0x3FF))) catch failure: trap("oom")
         else:
-            discard(out.push((u16)c) catch failure: trap("oom"))
+            _ = out.push((u16)c) catch failure: trap("oom")
 
 test "compile_ecmascript16 encodes UTF-16 patterns as QuickJS does":
     var message: u8[64]

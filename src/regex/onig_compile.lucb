@@ -18,17 +18,17 @@ func compile_node(re: Regex*, ni: i32, out: Vec[Inst]*) -> !:
     if kind == K_CHAR:
         var inst = Inst(op = OP_CHAR)
         inst.ch = node.ch
-        discard(try out.push(inst))
+        _ = try out.push(inst)
     elif kind == K_ANY:
-        discard(try out.push(Inst(op = OP_ANY)))
+        _ = try out.push(Inst(op = OP_ANY))
     elif kind == K_CLASS:
         var inst = Inst(op = OP_CLASS)
         inst.x = node.a
-        discard(try out.push(inst))
+        _ = try out.push(inst)
     elif kind == K_ANCHOR:
         var inst = Inst(op = OP_ASSERT)
         inst.x = node.a
-        discard(try out.push(inst))
+        _ = try out.push(inst)
     elif kind == K_CONCAT:
         var child = node.first_child
         while child != -1:
@@ -42,23 +42,23 @@ func compile_node(re: Regex*, ni: i32, out: Vec[Inst]*) -> !:
         else:
             var open = Inst(op = OP_SAVE)
             open.x = 2 * node.a
-            discard(try out.push(open))
+            _ = try out.push(open)
             try compile_node(re, node.first_child, out)
             var shut = Inst(op = OP_SAVE)
             shut.x = 2 * node.a + 1
-            discard(try out.push(shut))
+            _ = try out.push(shut)
     elif kind == K_REPEAT:
         try compile_repeat(re, ni, out)
     elif kind == K_BACKREF:
         var inst = Inst(op = OP_BACKREF)
         inst.x = node.a
-        discard(try out.push(inst))
+        _ = try out.push(inst)
     elif kind == K_LOOK:
         var sub = Vec[Inst]()
         try compile_node(re, node.first_child, &sub)
-        discard(try sub.push(Inst(op = OP_MATCH)))
+        _ = try sub.push(Inst(op = OP_MATCH))
         let plen = sub.used
-        let arr = try alloc Inst[plen] in memory.heap
+        let arr = try new Inst[plen] --- in memory.heap
         var i: usize = 0
         while i < plen:
             arr[i] = sub.data[i]
@@ -72,7 +72,7 @@ func compile_node(re: Regex*, ni: i32, out: Vec[Inst]*) -> !:
         inst.x = (i32)sidx
         inst.ahead = node.ahead
         inst.negate = node.negate
-        discard(try out.push(inst))
+        _ = try out.push(inst)
 
 # K_EMPTY and anything else emit nothing.
 
@@ -87,7 +87,7 @@ func compile_alt(re: Regex*, ni: i32, out: Vec[Inst]*) -> !:
             out.data[si].x = (i32)out.used
             try compile_node(re, child, out)
             let ji = try out.push(Inst(op = OP_JMP))
-            discard(try jumps.push((i32)ji))
+            _ = try jumps.push((i32)ji)
             out.data[si].y = (i32)out.used
         else:
             try compile_node(re, child, out)
@@ -122,10 +122,10 @@ func compile_repeat(re: Regex*, ni: i32, out: Vec[Inst]*) -> !:
         try compile_node(re, child, out)
         var guard = Inst(op = OP_PROGRESS)
         guard.x = slot
-        discard(try out.push(guard))
+        _ = try out.push(guard)
         var jump = Inst(op = OP_JMP)
         jump.x = loop_top
-        discard(try out.push(jump))
+        _ = try out.push(jump)
         if node.greedy:
             out.data[si].y = (i32)out.used
         else:
@@ -135,7 +135,7 @@ func compile_repeat(re: Regex*, ni: i32, out: Vec[Inst]*) -> !:
         var k: i32 = 0
         while k < hi - lo:
             let si = try out.push(Inst(op = OP_SPLIT))
-            discard(try splits.push((i32)si))
+            _ = try splits.push((i32)si)
             if node.greedy:
                 out.data[si].x = (i32)out.used
             else:
@@ -157,13 +157,13 @@ func compile_repeat(re: Regex*, ni: i32, out: Vec[Inst]*) -> !:
 
 func compute_first(re: Regex*) -> !:
     let plen = re.code.used
-    let seen = try alloc bool[plen] in memory.heap
+    let seen = try new bool[plen] --- in memory.heap
     var i: usize = 0
     while i < plen:
         seen[i] = false
         i += 1
     var stack = Vec[i32]()
-    discard(try stack.push(0))
+    _ = try stack.push(0)
     var bail = false
     while stack.used > 0 and not bail:
         let pc = stack.data[stack.used - 1]
@@ -174,17 +174,17 @@ func compute_first(re: Regex*) -> !:
         let inst = re.code.data[(usize)pc]
         let op = inst.op
         if op == OP_SAVE or op == OP_ASSERT or op == OP_MARK or op == OP_PROGRESS:
-            discard(try stack.push(pc + 1))
+            _ = try stack.push(pc + 1)
         elif op == OP_JMP:
-            discard(try stack.push(inst.x))
+            _ = try stack.push(inst.x)
         elif op == OP_SPLIT:
-            discard(try stack.push(inst.x))
-            discard(try stack.push(inst.y))
+            _ = try stack.push(inst.x)
+            _ = try stack.push(inst.y)
         elif op == OP_CHAR:
             if not first_has(re, inst.ch):
-                discard(try re.first_chars.push(inst.ch))
+                _ = try re.first_chars.push(inst.ch)
         elif op == OP_CLASS:
-            discard(try re.first_classes.push(inst.x))
+            _ = try re.first_classes.push(inst.x)
         else:
             re.first_any = true
             bail = true

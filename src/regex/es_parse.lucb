@@ -42,7 +42,7 @@ func es_backref(ps: EsParse*, list: const Vec[i32]*) -> i32!:
     re.nodes.data[(usize)n].y = (i32)list.used
     var i: usize = 0
     while i < list.used:
-        discard(try re.ref_lists.push(list.data[i]))
+        _ = try re.ref_lists.push(list.data[i])
         i += 1
     return n
 
@@ -124,11 +124,11 @@ func es_parse_term(ps: EsParse*) -> i32!:
         else:
             var p1 = ps.p + 1
             # Annex B: error if it is like a repetition count
-            discard(parse_digits(ps, &p1, true))
+            _ = parse_digits(ps, &p1, true)
             if ch_at(ps, p1) == ',':
                 p1 += 1
                 if is_ascii_digit(ch_at(ps, p1)):
-                    discard(parse_digits(ps, &p1, true))
+                    _ = parse_digits(ps, &p1, true)
             if ch_at(ps, p1) != '}':
                 class_atom = true
             else:
@@ -202,7 +202,7 @@ func es_parse_term(ps: EsParse*) -> i32!:
                 last_capture_count = ps.capture_count
                 var list = Vec[i32](heap = re.heap)
                 defer list.free_all()
-                discard(try list.push(v))
+                _ = try list.push(v)
                 atom = try es_backref(ps, &list)
         else:
             class_atom = true
@@ -237,8 +237,8 @@ func es_parse_paren(ps: EsParse*, last_capture_count: i32*) -> (i32, bool)!:
     if ch_at(ps, ps.p + 1) != '?':
         ps.p += 1
         # capture without group name
-        discard(try re.group_names.push(0))
-        discard(try re.group_names.push(0))
+        _ = try re.group_names.push(0)
+        _ = try re.group_names.push(0)
         return (try es_parse_capture(ps, last_capture_count), true)
     let c2 = ch_at(ps, ps.p + 2)
     if c2 == ':':
@@ -255,7 +255,7 @@ func es_parse_paren(ps: EsParse*, last_capture_count: i32*) -> (i32, bool)!:
             ps.p += 1
             remove_mask = try parse_modifiers(ps)
         if (add_mask == 0 and remove_mask == 0) or (add_mask & remove_mask) != 0:
-            discard(try es_fail(ps, "invalid modifiers"))
+            _ = try es_fail(ps, "invalid modifiers")
         try es_expect(ps, ':')
         let saved_ignore_case = ps.ignore_case
         let saved_multi_line = ps.multi_line
@@ -283,22 +283,22 @@ func es_parse_paren(ps: EsParse*, last_capture_count: i32*) -> (i32, bool)!:
         ps.p += 3
         var p = ps.p
         if not parse_group_name(ps, ps.name, &ps.name_len, &p):
-            discard(try es_fail(ps, "invalid group name"))
+            _ = try es_fail(ps, "invalid group name")
         ps.p = p
         let name = ps.name[0..<ps.name_len]
         # poor's man method to test duplicate group names.
         # XXX: this method does not catch all the errors
         if is_duplicate_group_name(ps, name, ps.group_name_scope):
-            discard(try es_fail(ps, "duplicate group name"))
+            _ = try es_fail(ps, "duplicate group name")
         # group name with a trailing zero
         for b in name:
-            discard(try re.group_names.push(b))
-        discard(try re.group_names.push(0))
-        discard(try re.group_names.push(ps.group_name_scope))
+            _ = try re.group_names.push(b)
+        _ = try re.group_names.push(0)
+        _ = try re.group_names.push(ps.group_name_scope)
         ps.has_named_captures = 1
         return (try es_parse_capture(ps, last_capture_count), true)
     else:
-        discard(try es_fail(ps, "invalid group"))
+        _ = try es_fail(ps, "invalid group")
     # a lookaround. Annex B allows a lookahead to be used as an atom for the quantifiers.
     let quantifiable = not ps.is_unicode and not is_backward
     if quantifiable:
@@ -330,12 +330,12 @@ func es_parse_named_backref(ps: EsParse*) -> i32!:
         # annex B: we tolerate invalid group names in non unicode mode if there is no named
         # capture definition
         if ps.is_unicode or try has_named_captures(ps):
-            discard(try es_fail(ps, "expecting group name"))
+            _ = try es_fail(ps, "expecting group name")
         return -1
     p1 += 3
     if not parse_group_name(ps, ps.name, &ps.name_len, &p1):
         if ps.is_unicode or try has_named_captures(ps):
-            discard(try es_fail(ps, "invalid group name"))
+            _ = try es_fail(ps, "invalid group name")
         return -1
     let name = ps.name[0..<ps.name_len]
     var list = Vec[i32](heap = ps.re.heap)
@@ -348,7 +348,7 @@ func es_parse_named_backref(ps: EsParse*) -> i32!:
         n = try parse_captures(ps, &dummy, name, &list)
         if n == 0:
             if ps.is_unicode or try has_named_captures(ps):
-                discard(try es_fail(ps, "group name not defined"))
+                _ = try es_fail(ps, "group name not defined")
             return -1
     ps.p = p1
     # a backreference to all the captures matching the group name

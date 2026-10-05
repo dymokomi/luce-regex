@@ -13,6 +13,8 @@
 
 # mark: Parse state ============================================================================
 
+import strings
+
 let CAPTURE_COUNT_MAX: i32 = 255
 let REGISTER_COUNT_MAX: i32 = 255
 
@@ -96,7 +98,7 @@ func from_surrogate(hi: u32, lo: u32) -> u32:
 # with `syntax_error`; compile_ecmascript reports the message.
 func es_fail(ps: EsParse*, text: fmt) -> i32!:
     var buf: u8[128]
-    let msg = format(buf, text) catch failure:
+    let msg = strings.format(buf, text) catch failure:
         recover (str)buf[0..<127]
     var n = msg.length
     if n > 127:
@@ -117,7 +119,7 @@ func char_text(buf: u8[], c: u8) -> str:
 func es_expect(ps: EsParse*, c: u8) -> !:
     if cur(ps) != c:
         var one: u8[1]
-        discard(try es_fail(ps, f"expecting '{char_text(one, c)}'"))
+        _ = try es_fail(ps, f"expecting '{char_text(one, c)}'")
     ps.p += 1
 
 # If allow_overflow is false, return -1 in case of

@@ -81,12 +81,12 @@ func parse_unicode_property(ps: EsParse*, s: StrSet*, is_inv: bool, allow_sequen
     var name: u8[64]
     var value: u8[64]
     if cur(ps) != '{':
-        discard(try es_fail(ps, "expecting '{' after \\p"))
+        _ = try es_fail(ps, "expecting '{' after \\p")
     ps.p += 1
     var name_len: usize = 0
     while is_unicode_char(cur(ps)):
         if name_len >= name.length - 1:
-            discard(try es_fail(ps, "unknown unicode property name"))
+            _ = try es_fail(ps, "unknown unicode property name")
         name[name_len] = cur(ps)
         name_len += 1
         ps.p += 1
@@ -95,22 +95,22 @@ func parse_unicode_property(ps: EsParse*, s: StrSet*, is_inv: bool, allow_sequen
         ps.p += 1
         while is_unicode_char(cur(ps)):
             if value_len >= value.length - 1:
-                discard(try es_fail(ps, "unknown unicode property value"))
+                _ = try es_fail(ps, "unknown unicode property value")
             value[value_len] = cur(ps)
             value_len += 1
             ps.p += 1
     if cur(ps) != '}':
-        discard(try es_fail(ps, "expecting '}'"))
+        _ = try es_fail(ps, "expecting '}'")
     ps.p += 1
 
     let ret = try property_lookup(ps, s, (str)name[0..<name_len], (str)value[0..<value_len],
                                   is_inv, allow_sequence_prop)
     if ret == -3:
-        discard(try es_fail(ps, "unknown unicode script"))
+        _ = try es_fail(ps, "unknown unicode script")
     if ret == -4:
-        discard(try es_fail(ps, "unknown unicode general category"))
+        _ = try es_fail(ps, "unknown unicode general category")
     if ret != 0:
-        discard(try es_fail(ps, "unknown unicode property name"))
+        _ = try es_fail(ps, "unknown unicode property name")
 
     # the ordering of case folding and inversion  differs with
     # unicode_sets. 'unicode_sets' ordering is more consistent
@@ -129,7 +129,7 @@ func parse_unicode_property(ps: EsParse*, s: StrSet*, is_inv: bool, allow_sequen
 # \q{...} with `ps.p` after the `q`.
 func parse_class_string_disjunction(ps: EsParse*, s: StrSet*) -> !:
     if cur(ps) != '{':
-        discard(try es_fail(ps, "expecting '{' after \\q"))
+        _ = try es_fail(ps, "expecting '{' after \\q")
     var text = Vec[u32](heap = ps.re.heap)
     defer text.free_all()
     set_init(ps, s)
@@ -139,7 +139,7 @@ func parse_class_string_disjunction(ps: EsParse*, s: StrSet*) -> !:
         text.used = 0
         while cur(ps) != '}' and cur(ps) != '|':
             let c = try get_class_atom(ps, none, false)
-            discard(try text.push((u32)c))
+            _ = try text.push((u32)c)
         try set_add(s, text.data[..<text.used])
         if cur(ps) == '}':
             break
@@ -289,7 +289,7 @@ func get_class_atom(ps: EsParse*, s: StrSet*?, inclass: bool) -> i32!:
 func es_check_stack(ps: EsParse*) -> !:
     if let f = ps.check_stack:
         if f(ps.opaque, 0):
-            discard(try es_fail(ps, "stack overflow"))
+            _ = try es_fail(ps, "stack overflow")
 
 # An operand of && or -- (re_parse_class_set_operand): a nested class or one atom.
 func parse_class_set_operand(ps: EsParse*, s: StrSet*) -> !:
@@ -337,7 +337,7 @@ func parse_nested_class(ps: EsParse*, s: StrSet*) -> !:
                 elif c1 >= CLASS_RANGE_BASE:
                     if ps.is_unicode:
                         set_free(&s1)
-                        discard(try es_fail(ps, "invalid class range"))
+                        _ = try es_fail(ps, "invalid class range")
                     # Annex B: match '-' character
                     class_atom = true
                 if not class_atom:
@@ -347,13 +347,13 @@ func parse_nested_class(ps: EsParse*, s: StrSet*) -> !:
                     if c2 >= CLASS_RANGE_BASE:
                         set_free(&s1)
                         if ps.is_unicode:
-                            discard(try es_fail(ps, "invalid class range"))
+                            _ = try es_fail(ps, "invalid class range")
                         # Annex B: match '-' character
                         ps.p = saved
                     else:
                         atom = false
                         if c2 < c1:
-                            discard(try es_fail(ps, "invalid class range"))
+                            _ = try es_fail(ps, "invalid class range")
                         if ps.ignore_case:
                             var cr2: unicode.CharRange
                             unicode.cr_init(&cr2, ps.re.heap.opaque, ps.re.heap.realloc_func)
@@ -381,7 +381,7 @@ func parse_nested_class(ps: EsParse*, s: StrSet*) -> !:
                     elif cur(ps) == '&' and ch_at(ps, ps.p + 1) == '&' and ch_at(ps, ps.p + 2) != '&':
                         ps.p += 2
                     else:
-                        discard(try es_fail(ps, "invalid operation in regular expression"))
+                        _ = try es_fail(ps, "invalid operation in regular expression")
                     try parse_class_set_operand(ps, &s1)
                     try set_op_free(s, &s1, unicode.cr_op_inter)
             elif cur(ps) == '-' and ch_at(ps, ps.p + 1) == '-':
@@ -392,7 +392,7 @@ func parse_nested_class(ps: EsParse*, s: StrSet*) -> !:
                     elif cur(ps) == '-' and ch_at(ps, ps.p + 1) == '-':
                         ps.p += 2
                     else:
-                        discard(try es_fail(ps, "invalid operation in regular expression"))
+                        _ = try es_fail(ps, "invalid operation in regular expression")
                     try parse_class_set_operand(ps, &s1)
                     try set_op_free(s, &s1, unicode.cr_op_sub)
         is_first = false
@@ -402,7 +402,7 @@ func parse_nested_class(ps: EsParse*, s: StrSet*) -> !:
         # compliant. The test here accepts more input than the
         # spec.
         if set_string_count(s) != 0:
-            discard(try es_fail(ps, "negated character class with strings in regular expression debugger eval code"))
+            _ = try es_fail(ps, "negated character class with strings in regular expression debugger eval code")
         try cr_check(unicode.cr_invert(&s.cr))
 
 # s = s op s1, then free s1.
